@@ -126,16 +126,15 @@ vagFilter =
 decodeVAGBlock :: S.StateT (Double, Double) Get [Int16]
 decodeVAGBlock = do
   bytes <- lift $ getByteString 16
-  let predictor = 0 -- B.index bytes 0 `shiftR` 4 -- high nibble, shouldn't be more than 4
+  let predictor = B.index bytes 0 `shiftR` 4 -- high nibble, shouldn't be more than 4
       shift'    = B.index bytes 0 .&. 0xF    -- low  nibble
       channel   = B.index bytes 1
       samples = do
-        i <- [0, 2 .. 26]
-        let numb = quot i 2 + 2
-            signExtend :: Word32 -> Word32
+        byte <- B.unpack $ B.drop 2 bytes
+        let signExtend :: Int32 -> Int32
             signExtend x = if (x .&. 0x8000) /= 0 then x .|. 0xFFFF0000 else x
-            ss0 = signExtend $ (fromIntegral (B.index bytes numb) .&. 0xF ) `shiftL` 12
-            ss1 = signExtend $ (fromIntegral (B.index bytes numb) .&. 0xF0) `shiftL` 8
+            ss0 = signExtend $ (fromIntegral byte .&. 0xF ) `shiftL` 12
+            ss1 = signExtend $ (fromIntegral byte .&. 0xF0) `shiftL` 8
         [   realToFrac $ ss0 `shiftR` fromIntegral shift'
           , realToFrac $ ss1 `shiftR` fromIntegral shift'
           ]
