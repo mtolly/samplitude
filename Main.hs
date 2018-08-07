@@ -287,18 +287,18 @@ applyStatus1 start status events = let
 
 renderSamples
   :: (MonadResource m, MonadIO n)
-  => RTB.T U.Seconds (Int, SDESEntry, V.Vector Int16)
+  => RTB.T U.Seconds (Int, Int, SDESEntry, V.Vector Int16)
   -> m (A.AudioSource n Int16)
 renderSamples rtb = do
   let samps = ATB.toPairList $ RTB.toAbsoluteEventList 0 rtb
       outputRate = 48000 :: Double
       lengthSecs = foldr max 0
         [ secs + fromIntegral (V.length v) / fromIntegral rate
-        | (secs, (rate, _, v)) <- samps
+        | (secs, (rate, _, _, v)) <- samps
         ]
   mv <- liftIO $ MV.new $ floor $ 2 * realToFrac (lengthSecs + 1) * outputRate
   liftIO $ MV.set mv 0
-  forM_ samps $ \(secs, (inputRate, sdes, v)) -> do
+  forM_ samps $ \(secs, (inputRate, noteVel, sdes, v)) -> do
     let src
           = SR.resampleTo outputRate SR.SincMediumQuality
           $ A.AudioSource (C.yield appliedPanVol) (realToFrac inputRate) 2 $ V.length v
@@ -307,7 +307,7 @@ renderSamples rtb = do
           in V.generate (V.length v * 2) $ \i -> case quotRem i 2 of
             (j, 0) -> (v' V.! j) * volRatio * panLeftRatio
             (j, _) -> (v' V.! j) * volRatio * panRightRatio
-        volRatio = fromIntegral (sdesVol sdes) / 0x7F
+        volRatio = fromIntegral noteVel / 0x7F
         panNormal = (fromIntegral (sdesPan sdes) / 0x7F) * 2 - 1
         theta = panNormal * (pi / 4)
         panLeftRatio  = (sqrt 2 / 2) * (cos theta - sin theta)
@@ -337,7 +337,7 @@ main = getArgs >>= \case
       soundNotes = flip RTB.mapMaybe trk $ \case
         E.MIDIEvent (EC.Cons _ (EC.Voice (ECV.NoteOn p v)))
           | ECV.fromPitch p < 96 && ECV.fromVelocity v /= 0
-          -> Just $ ECV.fromPitch p
+          -> Just (ECV.fromPitch p, ECV.fromVelocity v)
         _ -> Nothing
       bankChanges = flip RTB.mapMaybe trk $ \case
         E.MIDIEvent (EC.Cons _ (EC.Voice (ECV.Control cont v)))
@@ -353,7 +353,7 @@ main = getArgs >>= \case
         $ applyStatus1 Nothing (fmap Just progChanges)
         $ soundNotes
       appliedSources = flip RTB.mapMaybe applied $ \case
-        (Just bank, (Just prog, pitch)) -> Just $ let
+        (Just bank, (Just prog, (pitch, vel))) -> Just $ let
           (chunks, nse) = case drop bank sounds of
             x : _ -> x
             []    -> error $ "No bank with index " ++ show bank
@@ -378,7 +378,7 @@ main = getArgs >>= \case
             []    -> error $ "No sample with index " ++ show (sdesSAMPNumber sdes)
           bytes = BL.drop (fromIntegral $ sampFilePosition samp) nse
           samples = V.fromList $ decodeSamples bytes
-          in (sampRate samp, sdes, samples)
+          in (sampRate samp, vel, sdes, samples)
         _ -> Nothing
       tname = fromMaybe "" $ U.trackName trk
       in unless (RTB.null appliedSources || ("AXE" `isInfixOf` tname)) $ do
