@@ -49,6 +49,7 @@ data SAMPEntry = SAMPEntry
 
 data SDESEntry = SDESEntry
   { sdesNoteNumber :: Int
+  , sdesTranspose  :: Int -- semitones to move. seen in supersprode bass
   , sdesPan        :: Int -- 0x00 is left, 0x40 is center, 0x7F is right
   , sdesSAMPNumber :: Int
   -- lots of other parts not deciphered yet
@@ -94,12 +95,13 @@ getSDESEntry = do
   note <- getWord8
   _ <- getWord8 -- same as note
   _ <- getWord8 -- same as note
-  _ <- getByteString 13 -- lots of unknown stuff
+  transpose <- getInt8 -- usually 0. used in supersprode bass
+  _ <- getByteString 12 -- lots of unknown stuff
   _vol <- getWord8 -- I previously thought this was volume but don't think so now
   pan <- getWord8
   samp <- getWord8
   _ <- getByteString $ 3 + fromIntegral endbytes -- all 0
-  return $ SDESEntry (fromIntegral note) (fromIntegral pan) (fromIntegral samp) bs
+  return $ SDESEntry (fromIntegral note) (fromIntegral transpose) (fromIntegral pan) (fromIntegral samp) bs
 
 getINSTEntry :: Get INSTEntry
 getINSTEntry = do
@@ -212,11 +214,15 @@ decodeVAGBlock = do
       return $ round newSample
 
 decodeSamples :: BL.ByteString -> [Int16]
-decodeSamples = let
+decodeSamples bs = let
   go = decodeVAGBlock >>= \case
     []    -> return []
     block -> (block ++) <$> go
-  in runGet $ S.evalStateT go (0, 0)
+  in flip runGet bs $ do
+    getByteString 16 >>= \firstRow -> if B.all (== 0) firstRow
+      then return ()
+      else fail "first row of VAG block not all zero"
+    S.evalStateT go (0, 0)
 
 writeWAV :: (MonadResource m) => FilePath -> A.AudioSource m Int16 -> m ()
 writeWAV fp (A.AudioSource s r c _) = C.runConduit $ s .| C.bracketP
@@ -286,21 +292,24 @@ applyStatus1 start status events = let
 
 renderSamples
   :: (MonadResource m, MonadIO n)
-  => RTB.T U.Seconds (Int, Int, SDESEntry, V.Vector Int16)
+  => RTB.T U.Seconds (Int, Int, SDESEntry, V.Vector Int16, U.Seconds)
   -> m (A.AudioSource n Int16)
 renderSamples rtb = do
   let samps = ATB.toPairList $ RTB.toAbsoluteEventList 0 rtb
       outputRate = 48000 :: Double
       lengthSecs = foldr max 0
-        [ secs + fromIntegral (V.length v) / fromIntegral rate
-        | (secs, (rate, _, _, v)) <- samps
+        [ secs + samplen
+        | (secs, (_, _, _, _, samplen)) <- samps
         ]
   mv <- liftIO $ MV.new $ floor $ 2 * realToFrac (lengthSecs + 1) * outputRate
   liftIO $ MV.set mv 0
-  forM_ samps $ \(secs, (inputRate, noteVel, sdes, v)) -> do
-    let src
-          = SR.resampleTo outputRate SR.SincMediumQuality
-          $ A.AudioSource (C.yield appliedPanVol) (realToFrac inputRate) 2 $ V.length v
+  forM_ samps $ \(secs, (inputRate, noteVel, sdes, v, len)) -> do
+    let transposeFreq = 2 ** (fromIntegral (sdesTranspose sdes) / 12)
+        claimedRate = realToFrac inputRate * transposeFreq
+        src
+          = A.takeStart (A.Seconds $ realToFrac len)
+          $ SR.resampleTo outputRate SR.SincMediumQuality
+          $ A.AudioSource (C.yield appliedPanVol) claimedRate 2 $ V.length v
         appliedPanVol = let
           v' = V.map A.fractionalSample v
           in V.generate (V.length v * 2) $ \i -> case quotRem i 2 of
@@ -400,9 +409,8 @@ main = getArgs >>= \case
                     [] -> (["Bank " ++ show bank ++ " doesn't have sample index " ++ show (sdesSAMPNumber sdes)], [])
                     samp : _ -> let
                       bytes = BL.drop (fromIntegral $ sampFilePosition samp) nse
-                      lenFrames = ceiling (realToFrac len * realToFrac (sampRate samp) :: Double)
-                      samples = V.take lenFrames $ V.fromList $ decodeSamples bytes
-                      in ([], [(sampRate samp, vel, sdes, samples)])
+                      samples = V.fromList $ decodeSamples bytes
+                      in ([], [(sampRate samp, vel, sdes, samples, len)])
         _ -> (["Notes before bank and prog have been set"], [])
       in do
         putStrLn $ "# Track " ++ show i ++ ": " ++ maybe "no name" show (U.trackName trk)
