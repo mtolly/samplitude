@@ -292,7 +292,11 @@ renderSamples
 renderSamples rtb = do
   let samps = ATB.toPairList $ RTB.toAbsoluteEventList 0 rtb
       outputRate = 48000 :: Double
-  mv <- liftIO $ MV.new $ floor $ 2 * 5 * 60 * outputRate
+      lengthSecs = foldr max 0
+        [ secs + fromIntegral (V.length v) / fromIntegral rate
+        | (secs, (rate, _, v)) <- samps
+        ]
+  mv <- liftIO $ MV.new $ floor $ 2 * realToFrac (lengthSecs + 1) * outputRate
   liftIO $ MV.set mv 0
   forM_ samps $ \(secs, (inputRate, sdes, v)) -> do
     let src
