@@ -22,7 +22,7 @@ import qualified Data.Conduit.List                as CL
 import qualified Data.EventList.Absolute.TimeBody as ATB
 import qualified Data.EventList.Relative.TimeBody as RTB
 import           Data.Int
-import           Data.List                        (intercalate)
+import           Data.List                        (intercalate, isInfixOf)
 import           Data.Maybe                       (fromMaybe)
 import qualified Data.Vector.Storable             as V
 import qualified Data.Vector.Storable.Mutable     as MV
@@ -74,7 +74,7 @@ data Chunk
 
 getSAMPEntry :: Get SAMPEntry
 getSAMPEntry = do
-  0x12 <- getWord32le -- no idea what this is
+  0x12 <- getWord32le -- size of rest of entry
   chans <- getWord32le -- guessing this is channels, all 1 in file i'm looking at now
   rate <- getWord32le
   0 <- getWord32le -- dunno what this space is for
@@ -85,20 +85,20 @@ getSAMPEntry = do
 getSDESEntry :: Get SDESEntry
 getSDESEntry = do
   -- comments are observed values
-  _ <- getWord32le -- 0x1d
-  _ <- getWord32le -- 3
+  _ <- getWord32le -- usually 0x1d, seen 0x1c. size of rest of entry
+  endbytes <- getWord32le -- seen 3 when 0x1d, 2 when 0x1c
   note <- getWord8
   _ <- getWord8 -- same as note
   _ <- getWord8 -- same as note
   _ <- getByteString 15 -- lots of unknown stuff
   samp <- getWord8
-  _ <- getByteString 6 -- all 0
+  _ <- getByteString $ 3 + fromIntegral endbytes -- all 0
   return $ SDESEntry (fromIntegral note) (fromIntegral samp)
 
 getINSTEntry :: Get INSTEntry
 getINSTEntry = do
   -- comments are observed values
-  _ <- getWord32le -- 0xC
+  _ <- getWord32le -- 0xC, size of rest of entry
   _ <- getWord32le -- 1
   prog <- getWord16le
   _ <- getWord16le -- unknown
@@ -117,9 +117,15 @@ getINST n = case quotRem n 16 of
   _          -> fail $ "SAMP length of " <> show n <> " not divisible by 16"
 
 getSDES :: Word32 -> Get [SDESEntry]
-getSDES n = case quotRem n 33 of
-  (insts, 0) -> replicateM (fromIntegral insts) getSDESEntry
-  _          -> fail $ "SDES length of " <> show n <> " not divisible by 33"
+getSDES n = do
+  endPosn <- (+ fromIntegral n) <$> bytesRead
+  let go = bytesRead >>= \br -> case compare br endPosn of
+        EQ -> return []
+        LT -> do
+          ent <- getSDESEntry
+          (ent :) <$> go
+        GT -> fail "SDES went over its chunk length"
+  go
 
 getString :: Get B.ByteString
 getString = do
@@ -279,7 +285,7 @@ renderSamples :: (MonadResource m, MonadIO n) => RTB.T U.Seconds (Int, V.Vector 
 renderSamples rtb = do
   let samps = ATB.toPairList $ RTB.toAbsoluteEventList 0 rtb
       outputRate = 48000 :: Double
-  mv <- liftIO $ MV.new $ floor $ 6 * 60 * outputRate
+  mv <- liftIO $ MV.new $ floor $ 5 * 60 * outputRate
   liftIO $ MV.set mv 0
   forM_ samps $ \(secs, (inputRate, v)) -> do
     let src
@@ -327,22 +333,34 @@ main = getArgs >>= \case
         $ soundNotes
       appliedSources = flip RTB.mapMaybe applied $ \case
         (Just bank, (Just prog, pitch)) -> Just $ let
-          (chunks, nse) = sounds !! (bank - 1)
+          (chunks, nse) = sounds !! bank
           insts = concat [ xs | INST xs <- chunks ]
           (skipInsts, inst : _) = break ((== prog) . instProgNumber) insts
           skipSDES = sum $ map instSDESCount skipInsts
           sdeses = take (instSDESCount inst) $ drop skipSDES $ concat [ xs | SDES xs <- chunks ]
-          sdes = head [ sd | sd <- sdeses, sdesNoteNumber sd == pitch ]
+          sdes = case [ sd | sd <- sdeses, sdesNoteNumber sd == pitch ] of
+            [] -> error $ unwords
+              [ "No SDES entry found for bank"
+              , show bank
+              , "program"
+              , show prog
+              , "pitch"
+              , show pitch
+              , "in track"
+              , show $ maybe "with no name" show $ U.trackName trk
+              ]
+            x : _ -> x
           samp = concat [ xs | SAMP xs <- chunks ] !! sdesSAMPNumber sdes
           bytes = BL.drop (fromIntegral $ sampFilePosition samp) nse
           samples = V.fromList $ decodeSamples bytes
           in (sampRate samp, samples)
         _ -> Nothing
-      in unless (RTB.null appliedSources) $ do
+      tname = fromMaybe "" $ U.trackName trk
+      in unless (RTB.null appliedSources || ("AXE" `isInfixOf` tname)) $ do
         let name = concat
               [ if (i :: Int) < 10 then '0' : show i else show i
               , "_"
-              , map (\c -> if isAlphaNum c then c else '_') $ fromMaybe "" $ U.trackName trk
+              , map (\c -> if isAlphaNum c then c else '_') tname
               , ".wav"
               ]
         audio <- runResourceT $ renderSamples $ U.applyTempoTrack tmap appliedSources
