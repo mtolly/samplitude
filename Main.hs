@@ -49,14 +49,18 @@ data SAMPEntry = SAMPEntry
 
 data SDESEntry = SDESEntry
   { sdesNoteNumber :: Int
+  , sdesVol :: Int -- this is a guess! 7f looks like full volume, 64 is a bit quieter?
+  , sdesPan :: Int -- 0x00 is left, 0x40 is center, 0x7F is right
   , sdesSAMPNumber :: Int
   -- lots of other parts not deciphered yet
+  , sdesBytes :: B.ByteString
   } deriving (Eq, Show)
 
 data INSTEntry = INSTEntry
   { instProgNumber :: Int
   , instSDESCount  :: Int
   -- other parts not deciphered yet
+  , instBytes :: B.ByteString
   } deriving (Eq, Show)
 
 data Chunk
@@ -85,26 +89,30 @@ getSAMPEntry = do
 getSDESEntry :: Get SDESEntry
 getSDESEntry = do
   -- comments are observed values
-  _ <- getWord32le -- usually 0x1d, seen 0x1c. size of rest of entry
+  size <- getWord32le -- usually 0x1d, seen 0x1c. size of rest of entry
+  bs <- lookAhead $ getByteString $ fromIntegral size
   endbytes <- getWord32le -- seen 3 when 0x1d, 2 when 0x1c
   note <- getWord8
   _ <- getWord8 -- same as note
   _ <- getWord8 -- same as note
-  _ <- getByteString 15 -- lots of unknown stuff
+  _ <- getByteString 13 -- lots of unknown stuff
+  vol <- getWord8 -- TODO this is a guess!
+  pan <- getWord8
   samp <- getWord8
   _ <- getByteString $ 3 + fromIntegral endbytes -- all 0
-  return $ SDESEntry (fromIntegral note) (fromIntegral samp)
+  return $ SDESEntry (fromIntegral note) (fromIntegral vol) (fromIntegral pan) (fromIntegral samp) bs
 
 getINSTEntry :: Get INSTEntry
 getINSTEntry = do
   -- comments are observed values
-  _ <- getWord32le -- 0xC, size of rest of entry
+  size <- getWord32le -- 0xC, size of rest of entry
+  bs <- lookAhead $ getByteString $ fromIntegral size
   _ <- getWord32le -- 1
   prog <- getWord16le
   _ <- getWord16le -- unknown
   _ <- getWord16le -- 0
   sdes <- getWord16le -- number of SDES entries for this instrument
-  return $ INSTEntry (fromIntegral prog) (fromIntegral sdes)
+  return $ INSTEntry (fromIntegral prog) (fromIntegral sdes) bs
 
 getSAMP :: Word32 -> Get [SAMPEntry]
 getSAMP n = case quotRem n 22 of
@@ -205,15 +213,11 @@ decodeVAGBlock = do
       return $ round newSample
 
 decodeSamples :: BL.ByteString -> [Int16]
-decodeSamples bs = let
+decodeSamples = let
   go = decodeVAGBlock >>= \case
     []    -> return []
     block -> (block ++) <$> go
-  in flip runGet bs $ do
-    getByteString 16 >>= \firstRow -> if B.all (== 0) firstRow
-      then return ()
-      else fail "first row of VAG block not all zero"
-    S.evalStateT go (0, 0)
+  in runGet $ S.evalStateT go (0, 0)
 
 writeWAV :: (MonadResource m) => FilePath -> A.AudioSource m Int16 -> m ()
 writeWAV fp (A.AudioSource s r c _) = C.runConduit $ s .| C.bracketP
@@ -281,27 +285,40 @@ applyStatus1 start status events = let
     Right x -> (current, Just (current, x))
   in trackState start fn $ RTB.merge (fmap Left status) (fmap Right events)
 
-renderSamples :: (MonadResource m, MonadIO n) => RTB.T U.Seconds (Int, V.Vector Int16) -> m (A.AudioSource n Int16)
+renderSamples
+  :: (MonadResource m, MonadIO n)
+  => RTB.T U.Seconds (Int, SDESEntry, V.Vector Int16)
+  -> m (A.AudioSource n Int16)
 renderSamples rtb = do
   let samps = ATB.toPairList $ RTB.toAbsoluteEventList 0 rtb
       outputRate = 48000 :: Double
-  mv <- liftIO $ MV.new $ floor $ 5 * 60 * outputRate
+  mv <- liftIO $ MV.new $ floor $ 2 * 5 * 60 * outputRate
   liftIO $ MV.set mv 0
-  forM_ samps $ \(secs, (inputRate, v)) -> do
+  forM_ samps $ \(secs, (inputRate, sdes, v)) -> do
     let src
           = SR.resampleTo outputRate SR.SincMediumQuality
-          $ A.mapSamples A.fractionalSample
-          $ A.AudioSource (C.yield v) (realToFrac inputRate) 1 $ V.length v
+          $ A.AudioSource (C.yield appliedPanVol) (realToFrac inputRate) 2 $ V.length v
+        appliedPanVol = let
+          v' = V.map A.fractionalSample v
+          in V.generate (V.length v * 2) $ \i -> case quotRem i 2 of
+            (j, 0) -> (v' V.! j) * volRatio * panLeftRatio
+            (j, _) -> (v' V.! j) * volRatio * panRightRatio
+        volRatio = fromIntegral (sdesVol sdes) / 0x7F
+        panNormal = (fromIntegral (sdesPan sdes) / 0x7F) * 2 - 1
+        theta = panNormal * (pi / 4)
+        panLeftRatio  = (sqrt 2 / 2) * (cos theta - sin theta)
+        panRightRatio = (sqrt 2 / 2) * (cos theta + sin theta)
         writeToPosn framePosn = C.await >>= \case
           Nothing -> return ()
           Just v' -> do
-            currentArea <- liftIO $ V.freeze $ MV.slice framePosn (V.length v') mv
+            let samplePosn = framePosn * 2
+            currentArea <- liftIO $ V.freeze $ MV.slice samplePosn (V.length v') mv
             let mixed = V.zipWith (+) currentArea v'
-            liftIO $ V.copy (MV.slice framePosn (V.length mixed) mv) mixed
-            writeToPosn $ framePosn + V.length v'
+            liftIO $ V.copy (MV.slice samplePosn (V.length mixed) mv) mixed
+            writeToPosn $ samplePosn + V.length v'
     C.runConduit $ A.source src .| writeToPosn (floor $ realToFrac secs * outputRate)
   v <- liftIO $ V.unsafeFreeze mv
-  return $ A.mapSamples (A.integralSample . (* 0.5)) $ A.AudioSource (C.yield v) outputRate 1 $ V.length v
+  return $ A.mapSamples A.integralSample $ A.AudioSource (C.yield v) outputRate 2 $ V.length v `quot` 2
 
 main :: IO ()
 main = getArgs >>= \case
@@ -333,7 +350,9 @@ main = getArgs >>= \case
         $ soundNotes
       appliedSources = flip RTB.mapMaybe applied $ \case
         (Just bank, (Just prog, pitch)) -> Just $ let
-          (chunks, nse) = sounds !! bank
+          (chunks, nse) = case drop bank sounds of
+            x : _ -> x
+            []    -> error $ "No bank with index " ++ show bank
           insts = concat [ xs | INST xs <- chunks ]
           (skipInsts, inst : _) = break ((== prog) . instProgNumber) insts
           skipSDES = sum $ map instSDESCount skipInsts
@@ -350,10 +369,12 @@ main = getArgs >>= \case
               , show $ maybe "with no name" show $ U.trackName trk
               ]
             x : _ -> x
-          samp = concat [ xs | SAMP xs <- chunks ] !! sdesSAMPNumber sdes
+          samp = case drop (sdesSAMPNumber sdes) $ concat [ xs | SAMP xs <- chunks ] of
+            x : _ -> x
+            []    -> error $ "No sample with index " ++ show (sdesSAMPNumber sdes)
           bytes = BL.drop (fromIntegral $ sampFilePosition samp) nse
           samples = V.fromList $ decodeSamples bytes
-          in (sampRate samp, samples)
+          in (sampRate samp, sdes, samples)
         _ -> Nothing
       tname = fromMaybe "" $ U.trackName trk
       in unless (RTB.null appliedSources || ("AXE" `isInfixOf` tname)) $ do
@@ -368,12 +389,11 @@ main = getArgs >>= \case
   ["print", bnkPath] -> do
     bnk <- BL.fromStrict <$> B.readFile bnkPath
     let chunks = runGet riffChunks bnk
+    putStrLn "SAMPLE DIRECTIVES"
     forM_ (zip (concat [xs | SDES xs <- chunks]) (concat [xs | SDNM xs <- chunks])) $ \(ent, name) -> do
       print name
       print ent
-    forM_ (zip (concat [xs | SAMP xs <- chunks]) (concat [xs | SANM xs <- chunks])) $ \(ent, name) -> do
-      print name
-      print ent
+      print $ _showByteString $ sdesBytes ent
   "bnk" : bnks -> forM_ bnks $ \bnkPath -> do
     bnk <- BL.fromStrict <$> B.readFile bnkPath
     nse <- BL.fromStrict <$> B.readFile (bnkPath -<.> "nse")
