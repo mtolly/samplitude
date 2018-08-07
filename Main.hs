@@ -3,7 +3,7 @@
 module Main (main) where
 
 import           Control.Monad                    (forM, forM_, guard,
-                                                   replicateM, unless, when)
+                                                   replicateM, when)
 import           Control.Monad.IO.Class           (MonadIO, liftIO)
 import           Control.Monad.Trans.Class        (lift)
 import           Control.Monad.Trans.Resource     (MonadResource, runResourceT)
@@ -22,7 +22,7 @@ import qualified Data.Conduit.List                as CL
 import qualified Data.EventList.Absolute.TimeBody as ATB
 import qualified Data.EventList.Relative.TimeBody as RTB
 import           Data.Int
-import           Data.List                        (intercalate, isInfixOf)
+import           Data.List                        (intercalate, nub)
 import           Data.Maybe                       (fromMaybe)
 import qualified Data.Vector.Storable             as V
 import qualified Data.Vector.Storable.Mutable     as MV
@@ -343,6 +343,9 @@ getMIDINotes trk = let
     Just ((dt, (_, Nothing)), es') -> RTB.delay dt $ go es' -- off with no matching on
   in go $ RTB.normalize edges -- we just need (p, Nothing) before (p, Just _)
 
+rtbPartitionLists :: (NNC.C t) => RTB.T t ([a], [b]) -> (RTB.T t a, RTB.T t b)
+rtbPartitionLists trk = (RTB.flatten $ fmap fst trk, RTB.flatten $ fmap snd trk)
+
 main :: IO ()
 main = getArgs >>= \case
   "stems" : midPath : bnkPaths -> do
@@ -373,45 +376,48 @@ main = getArgs >>= \case
         = applyStatus1 Nothing (fmap Just bankChanges)
         $ applyStatus1 Nothing (fmap Just progChanges)
         $ soundNotes
-      appliedSources = flip RTB.mapMaybe applied $ \case
-        (Just bank, (Just prog, (pitch, vel, len))) -> Just $ let
-          (chunks, nse) = case drop bank sounds of
-            x : _ -> x
-            []    -> error $ "No bank with index " ++ show bank
-          insts = concat [ xs | INST xs <- chunks ]
-          (skipInsts, inst : _) = break ((== prog) . instProgNumber) insts
-          skipSDES = sum $ map instSDESCount skipInsts
-          sdeses = take (instSDESCount inst) $ drop skipSDES $ concat [ xs | SDES xs <- chunks ]
-          sdes = case [ sd | sd <- sdeses, sdesNoteNumber sd == pitch ] of
-            [] -> error $ unwords
-              [ "No SDES entry found for bank"
-              , show bank
-              , "program"
-              , show prog
-              , "pitch"
-              , show pitch
-              , "in track"
-              , show $ maybe "with no name" show $ U.trackName trk
-              ]
-            x : _ -> x
-          samp = case drop (sdesSAMPNumber sdes) $ concat [ xs | SAMP xs <- chunks ] of
-            x : _ -> x
-            []    -> error $ "No sample with index " ++ show (sdesSAMPNumber sdes)
-          bytes = BL.drop (fromIntegral $ sampFilePosition samp) nse
-          lenFrames = ceiling (realToFrac len * realToFrac (sampRate samp) :: Double)
-          samples = V.take lenFrames $ V.fromList $ decodeSamples bytes
-          in (sampRate samp, vel, sdes, samples)
-        _ -> Nothing
-      tname = fromMaybe "" $ U.trackName trk
-      in unless (RTB.null appliedSources || ("AXE" `isInfixOf` tname)) $ do
+      (warnings, appliedSources) = rtbPartitionLists $ flip fmap applied $ \case
+        (Just bank, (Just prog, (pitch, vel, len))) -> case drop bank sounds of
+          [] -> (["No bank with index " ++ show bank], [])
+          (chunks, nse) : _ -> let
+            insts = concat [ xs | INST xs <- chunks ]
+            in case break ((== prog) . instProgNumber) insts of
+              (_, []) -> (["Bank " ++ show bank ++ " doesn't have instrument with prog " ++ show prog], [])
+              (skipInsts, inst : _) -> let
+                skipSDES = sum $ map instSDESCount skipInsts
+                sdeses = take (instSDESCount inst) $ drop skipSDES $ concat [ xs | SDES xs <- chunks ]
+                in case [ sd | sd <- sdeses, sdesNoteNumber sd == pitch ] of
+                  [] -> ([unwords
+                    [ "No SDES entry found for bank"
+                    , show bank
+                    , "program"
+                    , show prog
+                    , "pitch"
+                    , show pitch
+                    ]], [])
+                  -- note: there can be more than 1 matching SDES. e.g. stereo pairs of samples in supersprode
+                  sdesMatch -> mconcat $ flip map sdesMatch $ \sdes -> case drop (sdesSAMPNumber sdes) $ concat [ xs | SAMP xs <- chunks ] of
+                    [] -> (["Bank " ++ show bank ++ " doesn't have sample index " ++ show (sdesSAMPNumber sdes)], [])
+                    samp : _ -> let
+                      bytes = BL.drop (fromIntegral $ sampFilePosition samp) nse
+                      lenFrames = ceiling (realToFrac len * realToFrac (sampRate samp) :: Double)
+                      samples = V.take lenFrames $ V.fromList $ decodeSamples bytes
+                      in ([], [(sampRate samp, vel, sdes, samples)])
+        _ -> (["Notes before bank and prog have been set"], [])
+      in do
+        putStrLn $ "# Track " ++ show i ++ ": " ++ maybe "no name" show (U.trackName trk)
+        forM_ (nub $ RTB.getBodies warnings) putStrLn
         let name = concat
               [ if (i :: Int) < 10 then '0' : show i else show i
               , "_"
-              , map (\c -> if isAlphaNum c then c else '_') tname
+              , map (\c -> if isAlphaNum c then c else '_') $ fromMaybe "" $ U.trackName trk
               , ".wav"
               ]
-        audio <- runResourceT $ renderSamples appliedSources
-        runResourceT $ writeWAV name audio
+        if RTB.null appliedSources
+          then putStrLn "No audio to render"
+          else do
+            audio <- runResourceT $ renderSamples appliedSources
+            runResourceT $ writeWAV name audio
   ["print", bnkPath] -> do
     bnk <- BL.fromStrict <$> B.readFile bnkPath
     let chunks = runGet riffChunks bnk
