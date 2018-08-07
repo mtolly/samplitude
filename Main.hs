@@ -2,8 +2,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Main (main) where
 
-import           Control.Monad                    (forM, forM_, replicateM,
-                                                   unless, when)
+import           Control.Monad                    (forM, forM_, guard,
+                                                   replicateM, unless, when)
 import           Control.Monad.IO.Class           (MonadIO, liftIO)
 import           Control.Monad.Trans.Class        (lift)
 import           Control.Monad.Trans.Resource     (MonadResource, runResourceT)
@@ -49,18 +49,17 @@ data SAMPEntry = SAMPEntry
 
 data SDESEntry = SDESEntry
   { sdesNoteNumber :: Int
-  , sdesVol :: Int -- this is a guess! 7f looks like full volume, 64 is a bit quieter?
-  , sdesPan :: Int -- 0x00 is left, 0x40 is center, 0x7F is right
+  , sdesPan        :: Int -- 0x00 is left, 0x40 is center, 0x7F is right
   , sdesSAMPNumber :: Int
   -- lots of other parts not deciphered yet
-  , sdesBytes :: B.ByteString
+  , sdesBytes      :: B.ByteString
   } deriving (Eq, Show)
 
 data INSTEntry = INSTEntry
   { instProgNumber :: Int
   , instSDESCount  :: Int
   -- other parts not deciphered yet
-  , instBytes :: B.ByteString
+  , instBytes      :: B.ByteString
   } deriving (Eq, Show)
 
 data Chunk
@@ -96,11 +95,11 @@ getSDESEntry = do
   _ <- getWord8 -- same as note
   _ <- getWord8 -- same as note
   _ <- getByteString 13 -- lots of unknown stuff
-  vol <- getWord8 -- TODO this is a guess!
+  _vol <- getWord8 -- I previously thought this was volume but don't think so now
   pan <- getWord8
   samp <- getWord8
   _ <- getByteString $ 3 + fromIntegral endbytes -- all 0
-  return $ SDESEntry (fromIntegral note) (fromIntegral vol) (fromIntegral pan) (fromIntegral samp) bs
+  return $ SDESEntry (fromIntegral note) (fromIntegral pan) (fromIntegral samp) bs
 
 getINSTEntry :: Get INSTEntry
 getINSTEntry = do
@@ -324,6 +323,26 @@ renderSamples rtb = do
   v <- liftIO $ V.unsafeFreeze mv
   return $ A.mapSamples A.integralSample $ A.AudioSource (C.yield v) outputRate 2 $ V.length v `quot` 2
 
+-- | Returns triples of (pitch, velocity, length)
+getMIDINotes :: (NNC.C t) => RTB.T t E.T -> RTB.T t (Int, Int, t)
+getMIDINotes trk = let
+  edges = flip RTB.mapMaybe trk $ \case
+    E.MIDIEvent (EC.Cons _ (EC.Voice (ECV.NoteOn p v))) -> let
+      v' = ECV.fromVelocity v
+      in Just (ECV.fromPitch p, guard (v' /= 0) >> Just v')
+    E.MIDIEvent (EC.Cons _ (EC.Voice (ECV.NoteOff p _)))
+      -> Just (ECV.fromPitch p, Nothing)
+    _ -> Nothing
+  offFor p (p', Nothing) = guard (p == p') >> Just ()
+  offFor _ _             = Nothing
+  go es = case RTB.viewL es of
+    Nothing -> RTB.empty
+    Just ((dt, (p, Just v)), es') -> case U.extractFirst (offFor p) es' of
+      Nothing                -> RTB.delay dt $ go es' -- on with no matching off
+      Just ((len, ()), es'') -> RTB.cons dt (p, v, len) $ go es''
+    Just ((dt, (_, Nothing)), es') -> RTB.delay dt $ go es' -- off with no matching on
+  in go $ RTB.normalize edges -- we just need (p, Nothing) before (p, Just _)
+
 main :: IO ()
 main = getArgs >>= \case
   "stems" : midPath : bnkPaths -> do
@@ -333,12 +352,14 @@ main = getArgs >>= \case
       nse <- BL.fromStrict <$> B.readFile (bnkPath -<.> "nse")
       return (runGet riffChunks bnk, nse)
     let tmap = U.makeTempoMap $ head trks
-    forM_ (zip [0..] $ tail trks) $ \(i, trk) -> let
-      soundNotes = flip RTB.mapMaybe trk $ \case
-        E.MIDIEvent (EC.Cons _ (EC.Voice (ECV.NoteOn p v)))
-          | ECV.fromPitch p < 96 && ECV.fromVelocity v /= 0
-          -> Just (ECV.fromPitch p, ECV.fromVelocity v)
-        _ -> Nothing
+    forM_ (zip [0..] $ tail trks) $ \(i, trkBeats) -> let
+      trk = U.applyTempoTrack tmap trkBeats
+      soundNotes = RTB.filter (\(p, _, _) -> p < 96) $ getMIDINotes trk
+      -- soundNotes = flip RTB.mapMaybe trk $ \case
+      --   E.MIDIEvent (EC.Cons _ (EC.Voice (ECV.NoteOn p v)))
+      --     | ECV.fromPitch p < 96 && ECV.fromVelocity v /= 0
+      --     -> Just (ECV.fromPitch p, ECV.fromVelocity v)
+      --   _ -> Nothing
       bankChanges = flip RTB.mapMaybe trk $ \case
         E.MIDIEvent (EC.Cons _ (EC.Voice (ECV.Control cont v)))
           | ECV.fromController cont == 0
@@ -353,7 +374,7 @@ main = getArgs >>= \case
         $ applyStatus1 Nothing (fmap Just progChanges)
         $ soundNotes
       appliedSources = flip RTB.mapMaybe applied $ \case
-        (Just bank, (Just prog, (pitch, vel))) -> Just $ let
+        (Just bank, (Just prog, (pitch, vel, len))) -> Just $ let
           (chunks, nse) = case drop bank sounds of
             x : _ -> x
             []    -> error $ "No bank with index " ++ show bank
@@ -377,7 +398,8 @@ main = getArgs >>= \case
             x : _ -> x
             []    -> error $ "No sample with index " ++ show (sdesSAMPNumber sdes)
           bytes = BL.drop (fromIntegral $ sampFilePosition samp) nse
-          samples = V.fromList $ decodeSamples bytes
+          lenFrames = ceiling (realToFrac len * realToFrac (sampRate samp) :: Double)
+          samples = V.take lenFrames $ V.fromList $ decodeSamples bytes
           in (sampRate samp, vel, sdes, samples)
         _ -> Nothing
       tname = fromMaybe "" $ U.trackName trk
@@ -388,7 +410,7 @@ main = getArgs >>= \case
               , map (\c -> if isAlphaNum c then c else '_') tname
               , ".wav"
               ]
-        audio <- runResourceT $ renderSamples $ U.applyTempoTrack tmap appliedSources
+        audio <- runResourceT $ renderSamples appliedSources
         runResourceT $ writeWAV name audio
   ["print", bnkPath] -> do
     bnk <- BL.fromStrict <$> B.readFile bnkPath
