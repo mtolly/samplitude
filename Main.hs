@@ -48,7 +48,9 @@ data SAMPEntry = SAMPEntry
   } deriving (Eq, Show)
 
 data SDESEntry = SDESEntry
-  { sdesNoteNumber :: Int
+  { sdesMinPitch   :: Int
+  , sdesMaxPitch   :: Int
+  , sdesBasePitch  :: Int
   , sdesTranspose  :: Int -- semitones to move. seen in supersprode bass
   , sdesPan        :: Int -- 0x00 is left, 0x40 is center, 0x7F is right
   , sdesSAMPNumber :: Int
@@ -92,16 +94,23 @@ getSDESEntry = do
   size <- getWord32le -- usually 0x1d, seen 0x1c. size of rest of entry
   bs <- lookAhead $ getByteString $ fromIntegral size
   endbytes <- getWord32le -- seen 3 when 0x1d, 2 when 0x1c
-  note <- getWord8
-  _ <- getWord8 -- same as note
-  _ <- getWord8 -- same as note
+  minPitch <- getWord8
+  maxPitch <- getWord8
+  basePitch <- getWord8
   transpose <- getInt8 -- usually 0. used in supersprode bass
   _ <- getByteString 12 -- lots of unknown stuff
   _vol <- getWord8 -- I previously thought this was volume but don't think so now
   pan <- getWord8
   samp <- getWord8
   _ <- getByteString $ 3 + fromIntegral endbytes -- all 0
-  return $ SDESEntry (fromIntegral note) (fromIntegral transpose) (fromIntegral pan) (fromIntegral samp) bs
+  return $ SDESEntry
+    (fromIntegral minPitch)
+    (fromIntegral maxPitch)
+    (fromIntegral basePitch)
+    (fromIntegral transpose)
+    (fromIntegral pan)
+    (fromIntegral samp)
+    bs
 
 getINSTEntry :: Get INSTEntry
 getINSTEntry = do
@@ -292,19 +301,19 @@ applyStatus1 start status events = let
 
 renderSamples
   :: (MonadResource m, MonadIO n)
-  => RTB.T U.Seconds (Int, Int, SDESEntry, V.Vector Int16, U.Seconds)
+  => RTB.T U.Seconds (Int, Int, Int, SDESEntry, V.Vector Int16, U.Seconds)
   -> m (A.AudioSource n Int16)
 renderSamples rtb = do
   let samps = ATB.toPairList $ RTB.toAbsoluteEventList 0 rtb
       outputRate = 48000 :: Double
       lengthSecs = foldr max 0
         [ secs + samplen
-        | (secs, (_, _, _, _, samplen)) <- samps
+        | (secs, (_, _, _, _, _, samplen)) <- samps
         ]
   mv <- liftIO $ MV.new $ floor $ 2 * realToFrac (lengthSecs + 1) * outputRate
   liftIO $ MV.set mv 0
-  forM_ samps $ \(secs, (inputRate, noteVel, sdes, v, len)) -> do
-    let transposeFreq = 2 ** (fromIntegral (sdesTranspose sdes) / 12)
+  forM_ samps $ \(secs, (inputRate, notePitch, noteVel, sdes, v, len)) -> do
+    let transposeFreq = 2 ** (fromIntegral (sdesTranspose sdes + (notePitch - sdesBasePitch sdes)) / 12)
         claimedRate = realToFrac inputRate * transposeFreq
         src
           = A.takeStart (A.Seconds $ realToFrac len)
@@ -395,7 +404,7 @@ main = getArgs >>= \case
               (skipInsts, inst : _) -> let
                 skipSDES = sum $ map instSDESCount skipInsts
                 sdeses = take (instSDESCount inst) $ drop skipSDES $ concat [ xs | SDES xs <- chunks ]
-                in case [ sd | sd <- sdeses, sdesNoteNumber sd == pitch ] of
+                in case [ sd | sd <- sdeses, sdesMinPitch sd <= pitch && pitch <= sdesMaxPitch sd ] of
                   [] -> ([unwords
                     [ "No SDES entry found for bank"
                     , show bank
@@ -410,7 +419,7 @@ main = getArgs >>= \case
                     samp : _ -> let
                       bytes = BL.drop (fromIntegral $ sampFilePosition samp) nse
                       samples = V.fromList $ decodeSamples bytes
-                      in ([], [(sampRate samp, vel, sdes, samples, len)])
+                      in ([], [(sampRate samp, pitch, vel, sdes, samples, len)])
         _ -> (["Notes before bank and prog have been set"], [])
       in do
         putStrLn $ "# Track " ++ show i ++ ": " ++ maybe "no name" show (U.trackName trk)
@@ -429,11 +438,22 @@ main = getArgs >>= \case
   ["print", bnkPath] -> do
     bnk <- BL.fromStrict <$> B.readFile bnkPath
     let chunks = runGet riffChunks bnk
+    putStrLn "INSTRUMENTS"
+    forM_ (zip (concat [xs | INST xs <- chunks]) (concat [xs | INNM xs <- chunks])) $ \(ent, name) -> do
+      print name
+      print ent
+      print $ _showByteString $ instBytes ent
+    putStrLn ""
     putStrLn "SAMPLE DIRECTIVES"
     forM_ (zip (concat [xs | SDES xs <- chunks]) (concat [xs | SDNM xs <- chunks])) $ \(ent, name) -> do
       print name
       print ent
       print $ _showByteString $ sdesBytes ent
+    putStrLn ""
+    putStrLn "SAMPLES"
+    forM_ (zip (concat [xs | SAMP xs <- chunks]) (concat [xs | SANM xs <- chunks])) $ \(ent, name) -> do
+      print name
+      print ent
   "bnk" : bnks -> forM_ bnks $ \bnkPath -> do
     bnk <- BL.fromStrict <$> B.readFile bnkPath
     nse <- BL.fromStrict <$> B.readFile (bnkPath -<.> "nse")
