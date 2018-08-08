@@ -22,8 +22,9 @@ import qualified Data.Conduit.List                as CL
 import qualified Data.EventList.Absolute.TimeBody as ATB
 import qualified Data.EventList.Relative.TimeBody as RTB
 import           Data.Int
-import           Data.List                        (intercalate, nub)
-import           Data.Maybe                       (fromMaybe)
+import           Data.List                        (intercalate, nub,
+                                                   stripPrefix)
+import           Data.Maybe                       (fromMaybe, mapMaybe)
 import qualified Data.Vector.Storable             as V
 import qualified Data.Vector.Storable.Mutable     as MV
 import           Data.Word
@@ -35,10 +36,11 @@ import qualified Sound.MIDI.File.Load             as Load
 import qualified Sound.MIDI.Message.Channel       as EC
 import qualified Sound.MIDI.Message.Channel.Voice as ECV
 import qualified Sound.MIDI.Util                  as U
-import           System.Directory                 (createDirectoryIfMissing)
+import           System.Directory                 (createDirectoryIfMissing,
+                                                   listDirectory)
 import           System.Environment               (getArgs)
-import           System.FilePath                  (dropExtension, (-<.>), (<.>),
-                                                   (</>))
+import           System.FilePath                  (dropExtension, takeExtension,
+                                                   (-<.>), (<.>), (</>))
 import qualified System.IO                        as IO
 
 data SAMPEntry = SAMPEntry
@@ -65,11 +67,17 @@ data INSTEntry = INSTEntry
   , instBytes      :: B.ByteString
   } deriving (Eq, Show)
 
+data BANKEntry = BANKEntry
+  { bankNumber :: Int
+  -- other parts not deciphered yet
+  , bankBytes  :: B.ByteString
+  } deriving (Eq, Show)
+
 data Chunk
   = SAMP [SAMPEntry] -- samples
   | SANM [B.ByteString] -- sample names
   | SAFN [B.ByteString] -- sample filenames
-  | BANK B.ByteString -- bank(s?)
+  | BANK BANKEntry -- bank(s?)
   | BKNM B.ByteString -- bank name
   | INST [INSTEntry] -- instruments
   | INNM [B.ByteString] -- instrument names
@@ -124,6 +132,12 @@ getINSTEntry = do
   sdes <- getWord16le -- number of SDES entries for this instrument
   return $ INSTEntry (fromIntegral prog) (fromIntegral sdes) bs
 
+getBANK :: Word32 -> Get BANKEntry
+getBANK n = do
+  bs <- getByteString $ fromIntegral n
+  let bankNum = B.index bs 8
+  return $ BANKEntry (fromIntegral bankNum) bs
+
 getSAMP :: Word32 -> Get [SAMPEntry]
 getSAMP n = case quotRem n 22 of
   (samps, 0) -> replicateM (fromIntegral samps) getSAMPEntry
@@ -172,7 +186,7 @@ riffChunks = isEmpty >>= \case
       "SAMP" -> SAMP <$> getSAMP size
       "SANM" -> SANM <$> getStringList size
       "SAFN" -> SAFN <$> getStringList size
-      "BANK" -> BANK <$> getByteString (fromIntegral size)
+      "BANK" -> BANK <$> getBANK size
       "BKNM" -> do
         1 <- getWord32le -- dunno
         BKNM <$> getString
@@ -364,23 +378,34 @@ getMIDINotes trk = let
 rtbPartitionLists :: (NNC.C t) => RTB.T t ([a], [b]) -> (RTB.T t a, RTB.T t b)
 rtbPartitionLists trk = (RTB.flatten $ fmap fst trk, RTB.flatten $ fmap snd trk)
 
+findSong :: FilePath -> IO (FilePath, [FilePath])
+findSong dir = do
+  files <- listDirectory dir
+  let stripSuffix sfx xs = fmap reverse $ stripPrefix (reverse sfx) (reverse xs)
+  name <- case mapMaybe (stripSuffix "_g.mid") files of
+    name : _ -> return name
+    []       -> error "Couldn't find <song>_g.mid in the folder"
+  let mid = dir </> (name ++ "_g.mid")
+      banks = map (dir </>) $ filter ((== ".bnk") . takeExtension) files
+  return (mid, banks)
+
 main :: IO ()
 main = getArgs >>= \case
-  "stems" : midPath : bnkPaths -> do
+  ["stems", songDir] -> do
+    (midPath, bnkPaths) <- findSong songDir
     Left trks <- U.decodeFile <$> Load.fromFile midPath
     sounds <- forM bnkPaths $ \bnkPath -> do
       bnk <- BL.fromStrict <$> B.readFile bnkPath
       nse <- BL.fromStrict <$> B.readFile (bnkPath -<.> "nse")
-      return (runGet riffChunks bnk, nse)
+      let chunks = runGet riffChunks bnk
+      i <- case [ b | BANK b <- chunks ] of
+        []    -> error $ "Bank " ++ show bnkPath ++ " has no BANK chunk"
+        b : _ -> return $ bankNumber b
+      return (i, (chunks, nse))
     let tmap = U.makeTempoMap $ head trks
     forM_ (zip [0..] $ tail trks) $ \(i, trkBeats) -> let
       trk = U.applyTempoTrack tmap trkBeats
       soundNotes = RTB.filter (\(p, _, _) -> p < 96) $ getMIDINotes trk
-      -- soundNotes = flip RTB.mapMaybe trk $ \case
-      --   E.MIDIEvent (EC.Cons _ (EC.Voice (ECV.NoteOn p v)))
-      --     | ECV.fromPitch p < 96 && ECV.fromVelocity v /= 0
-      --     -> Just (ECV.fromPitch p, ECV.fromVelocity v)
-      --   _ -> Nothing
       bankChanges = flip RTB.mapMaybe trk $ \case
         E.MIDIEvent (EC.Cons _ (EC.Voice (ECV.Control cont v)))
           | ECV.fromController cont == 0
@@ -395,9 +420,9 @@ main = getArgs >>= \case
         $ applyStatus1 Nothing (fmap Just progChanges)
         $ soundNotes
       (warnings, appliedSources) = rtbPartitionLists $ flip fmap applied $ \case
-        (Just bank, (Just prog, (pitch, vel, len))) -> case drop bank sounds of
-          [] -> (["No bank with index " ++ show bank], [])
-          (chunks, nse) : _ -> let
+        (Just bank, (Just prog, (pitch, vel, len))) -> case lookup bank sounds of
+          Nothing -> (["No bank with index " ++ show bank], [])
+          Just (chunks, nse) -> let
             insts = concat [ xs | INST xs <- chunks ]
             in case break ((== prog) . instProgNumber) insts of
               (_, []) -> (["Bank " ++ show bank ++ " doesn't have instrument with prog " ++ show prog], [])
@@ -419,12 +444,12 @@ main = getArgs >>= \case
                     samp : _ -> let
                       bytes = BL.drop (fromIntegral $ sampFilePosition samp) nse
                       samples = V.fromList $ decodeSamples bytes
-                      in ([], [(sampRate samp, pitch, vel, sdes, samples, len)])
+                      in ([], [(sampRate samp, pitch, vel, sdes, samples, len + 0.001)])
         _ -> (["Notes before bank and prog have been set"], [])
       in do
         putStrLn $ "# Track " ++ show i ++ ": " ++ maybe "no name" show (U.trackName trk)
         forM_ (nub $ RTB.getBodies warnings) putStrLn
-        let name = concat
+        let name = songDir </> concat
               [ if (i :: Int) < 10 then '0' : show i else show i
               , "_"
               , map (\c -> if isAlphaNum c then c else '_') $ fromMaybe "" $ U.trackName trk
