@@ -1,2 +1,4 @@
 *.bnk
 *.nse
+.stack-work/
+win/

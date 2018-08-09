@@ -3,7 +3,7 @@
 module Main (main) where
 
 import           Control.Monad                    (forM, forM_, guard,
-                                                   replicateM, when)
+                                                   replicateM, void, when)
 import           Control.Monad.IO.Class           (MonadIO, liftIO)
 import           Control.Monad.Trans.Class        (lift)
 import           Control.Monad.Trans.Resource     (MonadResource, runResourceT)
@@ -391,7 +391,53 @@ findSong dir = do
 
 main :: IO ()
 main = getArgs >>= \case
-  ["stems", songDir] -> do
+  [] -> do
+    putStrLn "samplitude (Amplitude [PS2] audio renderer)"
+    putStrLn "Drag a song folder onto this .exe to run."
+    void getLine
+  "print" : bnkPaths -> forM_ bnkPaths $ \bnkPath -> do
+    putStrLn bnkPath
+    putStrLn ""
+    bnk <- BL.fromStrict <$> B.readFile bnkPath
+    let chunks = runGet riffChunks bnk
+    putStrLn "INSTRUMENTS"
+    forM_ (zip (concat [xs | INST xs <- chunks]) (concat [xs | INNM xs <- chunks])) $ \(ent, name) -> do
+      print name
+      print ent
+      print $ _showByteString $ instBytes ent
+    putStrLn ""
+    putStrLn "SAMPLE DIRECTIVES"
+    forM_ (zip (concat [xs | SDES xs <- chunks]) (concat [xs | SDNM xs <- chunks])) $ \(ent, name) -> do
+      print name
+      print ent
+      print $ _showByteString $ sdesBytes ent
+    putStrLn ""
+    putStrLn "SAMPLES"
+    forM_ (zip (concat [xs | SAMP xs <- chunks]) (concat [xs | SANM xs <- chunks])) $ \(ent, name) -> do
+      print name
+      print ent
+    putStrLn ""
+  "samples" : bnks -> forM_ bnks $ \bnkPath -> do
+    bnk <- BL.fromStrict <$> B.readFile bnkPath
+    nse <- BL.fromStrict <$> B.readFile (bnkPath -<.> "nse")
+    let outDir = dropExtension bnkPath ++ "_samples"
+    createDirectoryIfMissing False outDir
+    let chunks = runGet riffChunks bnk
+        samp = concat [ xs | SAMP xs <- chunks ]
+        sanm = concat [ xs | SANM xs <- chunks ]
+    forM_ (zip samp sanm) $ \(entry, name) -> do
+      let bytes = BL.drop (fromIntegral $ sampFilePosition entry) nse
+          samples = V.fromList $ decodeSamples bytes
+      when (sampRate entry /= 0) $ do
+        -- BL.writeFile (outDir </> B8.unpack name <.> "bin") bytes
+        print (entry, name)
+        runResourceT $ writeWAV (outDir </> B8.unpack name <.> "wav") $ A.AudioSource
+          (C.yield samples)
+          (realToFrac $ sampRate entry)
+          1
+          (V.length samples)
+  songDirs -> forM_ songDirs $ \songDir -> do
+    putStrLn $ "## " ++ songDir
     (midPath, bnkPaths) <- findSong songDir
     Left trks <- U.decodeFile <$> Load.fromFile midPath
     sounds <- forM bnkPaths $ \bnkPath -> do
@@ -460,42 +506,3 @@ main = getArgs >>= \case
           else do
             audio <- runResourceT $ renderSamples appliedSources
             runResourceT $ writeWAV name audio
-  ["print", bnkPath] -> do
-    bnk <- BL.fromStrict <$> B.readFile bnkPath
-    let chunks = runGet riffChunks bnk
-    putStrLn "INSTRUMENTS"
-    forM_ (zip (concat [xs | INST xs <- chunks]) (concat [xs | INNM xs <- chunks])) $ \(ent, name) -> do
-      print name
-      print ent
-      print $ _showByteString $ instBytes ent
-    putStrLn ""
-    putStrLn "SAMPLE DIRECTIVES"
-    forM_ (zip (concat [xs | SDES xs <- chunks]) (concat [xs | SDNM xs <- chunks])) $ \(ent, name) -> do
-      print name
-      print ent
-      print $ _showByteString $ sdesBytes ent
-    putStrLn ""
-    putStrLn "SAMPLES"
-    forM_ (zip (concat [xs | SAMP xs <- chunks]) (concat [xs | SANM xs <- chunks])) $ \(ent, name) -> do
-      print name
-      print ent
-  "bnk" : bnks -> forM_ bnks $ \bnkPath -> do
-    bnk <- BL.fromStrict <$> B.readFile bnkPath
-    nse <- BL.fromStrict <$> B.readFile (bnkPath -<.> "nse")
-    let outDir = dropExtension bnkPath ++ "_samples"
-    createDirectoryIfMissing False outDir
-    let chunks = runGet riffChunks bnk
-        samp = concat [ xs | SAMP xs <- chunks ]
-        sanm = concat [ xs | SANM xs <- chunks ]
-    forM_ (zip samp sanm) $ \(entry, name) -> do
-      let bytes = BL.drop (fromIntegral $ sampFilePosition entry) nse
-          samples = V.fromList $ decodeSamples bytes
-      when (sampRate entry /= 0) $ do
-        -- BL.writeFile (outDir </> B8.unpack name <.> "bin") bytes
-        print (entry, name)
-        runResourceT $ writeWAV (outDir </> B8.unpack name <.> "wav") $ A.AudioSource
-          (C.yield samples)
-          (realToFrac $ sampRate entry)
-          1
-          (V.length samples)
-  _ -> error "incorrect usage"

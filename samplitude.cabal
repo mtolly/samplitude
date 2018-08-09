@@ -1,4 +1,4 @@
-name:               amplibank
+name:               samplitude
 version:            0.0.1
 license:            BSD3
 author:             Michael Tolly
@@ -6,7 +6,7 @@ maintainer:         miketolly@gmail.com
 build-type:         Simple
 cabal-version:      >= 1.10
 
-executable amplibank
+executable samplitude
   build-depends:      base, zlib, bytestring, binary, directory, filepath, transformers, conduit-audio, conduit, vector, resourcet, midi, midi-util, event-list, non-negative, conduit-audio-samplerate
   main-is:            Main.hs
   ghc-options:        -Wall -O
