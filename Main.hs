@@ -69,6 +69,7 @@ data INSTEntry = INSTEntry
 
 data BANKEntry = BANKEntry
   { bankNumber :: Int
+  , bankINSTCount :: Int
   -- other parts not deciphered yet
   , bankBytes  :: B.ByteString
   } deriving (Eq, Show)
@@ -83,13 +84,26 @@ data Chunk
   | INNM [B.ByteString] -- instrument names
   | SDES [SDESEntry] -- sample... directives?
   | SDNM [B.ByteString] -- SDES names
-  -- | Unknown B.ByteString BL.ByteString
   deriving (Eq, Show)
 
+sizedArea :: (B.ByteString -> Get a) -> Get a
+sizedArea g = do
+  size <- getWord32le
+  bs <- lookAhead $ getByteString $ fromIntegral size
+  startPosn <- bytesRead
+  x <- g bs
+  endPosn <- bytesRead
+  if startPosn + fromIntegral size == endPosn
+    then return x
+    else fail $ unwords
+      [ "Struct with size at", show startPosn
+      , "should've been", show size
+      , "bytes but was", show (endPosn - startPosn)
+      ]
+
 getSAMPEntry :: Get SAMPEntry
-getSAMPEntry = do
-  0x12 <- getWord32le -- size of rest of entry
-  chans <- getWord32le -- guessing this is channels, all 1 in file i'm looking at now
+getSAMPEntry = sizedArea $ \_ -> do
+  chans <- getWord32le -- guessing this is channels, all 1 in files i've seen
   rate <- getWord32le
   0 <- getWord32le -- dunno what this space is for
   0 <- getWord16le
@@ -97,11 +111,8 @@ getSAMPEntry = do
   return $ SAMPEntry (fromIntegral chans) (fromIntegral rate) (fromIntegral posn)
 
 getSDESEntry :: Get SDESEntry
-getSDESEntry = do
-  -- comments are observed values
-  size <- getWord32le -- usually 0x1d, seen 0x1c. size of rest of entry
-  bs <- lookAhead $ getByteString $ fromIntegral size
-  endbytes <- getWord32le -- seen 3 when 0x1d, 2 when 0x1c
+getSDESEntry = sizedArea $ \bs -> do
+  endbytes <- getWord32le -- size of some unknown variable field at end
   minPitch <- getWord8
   maxPitch <- getWord8
   basePitch <- getWord8
@@ -121,14 +132,11 @@ getSDESEntry = do
     bs
 
 getINSTEntry :: Get INSTEntry
-getINSTEntry = do
-  -- comments are observed values
-  size <- getWord32le -- 0xC, size of rest of entry
-  bs <- lookAhead $ getByteString $ fromIntegral size
-  _ <- getWord32le -- 1
+getINSTEntry = sizedArea $ \bs -> do
+  _ <- getWord32le -- observed 1
   prog <- getWord16le
   _ <- getWord16le -- unknown
-  _ <- getWord16le -- 0
+  _ <- getWord16le -- observed 0
   sdes <- getWord16le -- number of SDES entries for this instrument
   return $ INSTEntry (fromIntegral prog) (fromIntegral sdes) bs
 
@@ -136,7 +144,10 @@ getBANK :: Word32 -> Get BANKEntry
 getBANK n = do
   bs <- getByteString $ fromIntegral n
   let bankNum = B.index bs 8
-  return $ BANKEntry (fromIntegral bankNum) bs
+      instCount = B.index bs 11
+  -- I assume you'd use the inst count with multiple BANK entries in a .bnk,
+  -- but I haven't seen that yet.
+  return $ BANKEntry (fromIntegral bankNum) (fromIntegral instCount) bs
 
 getSAMP :: Word32 -> Get [SAMPEntry]
 getSAMP n = case quotRem n 22 of
@@ -299,20 +310,6 @@ instance LE Int32 where
 instance LE Int16 where
   writeLE h w = writeLE h (fromIntegral w :: Word16)
 
-trackState :: (NNC.C t) => s -> (s -> t -> a -> (s, Maybe b)) -> RTB.T t a -> RTB.T t b
-trackState curState step rtb = case RTB.viewL rtb of
-  Nothing -> RTB.empty
-  Just ((dt, x), rtb') -> case step curState dt x of
-    (nextState, Nothing) -> RTB.delay dt   $ trackState nextState step rtb'
-    (nextState, Just y ) -> RTB.cons  dt y $ trackState nextState step rtb'
-
-applyStatus1 :: (NNC.C t, Ord s, Ord a) => s -> RTB.T t s -> RTB.T t a -> RTB.T t (s, a)
-applyStatus1 start status events = let
-  fn current _ = \case
-    Left  s -> (s      , Nothing          )
-    Right x -> (current, Just (current, x))
-  in trackState start fn $ RTB.merge (fmap Left status) (fmap Right events)
-
 renderSamples
   :: (MonadResource m, MonadIO n)
   => RTB.T U.Seconds (Int, Int, Int, SDESEntry, V.Vector Int16, U.Seconds)
@@ -354,6 +351,20 @@ renderSamples rtb = do
     C.runConduit $ A.source src .| writeToPosn (floor $ realToFrac secs * outputRate)
   v <- liftIO $ V.unsafeFreeze mv
   return $ A.mapSamples A.integralSample $ A.AudioSource (C.yield v) outputRate 2 $ V.length v `quot` 2
+
+trackState :: (NNC.C t) => s -> (s -> t -> a -> (s, Maybe b)) -> RTB.T t a -> RTB.T t b
+trackState curState step rtb = case RTB.viewL rtb of
+  Nothing -> RTB.empty
+  Just ((dt, x), rtb') -> case step curState dt x of
+    (nextState, Nothing) -> RTB.delay dt   $ trackState nextState step rtb'
+    (nextState, Just y ) -> RTB.cons  dt y $ trackState nextState step rtb'
+
+applyStatus1 :: (NNC.C t, Ord s, Ord a) => s -> RTB.T t s -> RTB.T t a -> RTB.T t (s, a)
+applyStatus1 start status events = let
+  fn current _ = \case
+    Left  s -> (s      , Nothing          )
+    Right x -> (current, Just (current, x))
+  in trackState start fn $ RTB.merge (fmap Left status) (fmap Right events)
 
 -- | Returns triples of (pitch, velocity, length)
 getMIDINotes :: (NNC.C t) => RTB.T t E.T -> RTB.T t (Int, Int, t)
@@ -463,6 +474,9 @@ main = getArgs >>= \case
   ["print", bnkPath] -> do
     bnk <- BL.fromStrict <$> B.readFile bnkPath
     let chunks = runGet riffChunks bnk
+    putStrLn "BANK INFO"
+    forM_ [x | BANK x <- chunks] print
+    putStrLn ""
     putStrLn "INSTRUMENTS"
     forM_ (zip (concat [xs | INST xs <- chunks]) (concat [xs | INNM xs <- chunks])) $ \(ent, name) -> do
       print name
