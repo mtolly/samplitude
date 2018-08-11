@@ -5,6 +5,7 @@ module Frequency where
 import           Control.Monad   (forM, replicateM, unless)
 import           Data.Binary.Get
 import qualified Data.ByteString as B
+import           HexView
 
 data HD = HD
   { hdProg :: [Maybe ProgEntry]
@@ -60,7 +61,7 @@ getSCEIList typ g = getSCEI typ $ \_size -> do
 data VagiEntry = VagiEntry
   { vagiFilePosition :: Int
   , vagiRate         :: Int
-  , vagiBytes        :: B.ByteString
+  , vagiBytes        :: HexView
   } deriving (Eq, Show)
 
 getVagiEntry :: Get VagiEntry
@@ -69,11 +70,11 @@ getVagiEntry = do
   posn <- getWord32le
   rate <- getWord16le
   _ <- getByteString 2
-  return $ VagiEntry (fromIntegral posn) (fromIntegral rate) bs
+  return $ VagiEntry (fromIntegral posn) (fromIntegral rate) (HexView bs)
 
 data SmplEntry = SmplEntry
   { smplVagiIndex :: Int
-  , smplBytes     :: B.ByteString
+  , smplBytes     :: HexView
   } deriving (Eq, Show)
 
 getSmplEntry :: Get SmplEntry
@@ -81,11 +82,11 @@ getSmplEntry = do
   bs <- lookAhead $ getByteString 42
   vagi <- getWord16le
   _ <- getByteString 40
-  return $ SmplEntry (fromIntegral vagi) bs
+  return $ SmplEntry (fromIntegral vagi) (HexView bs)
 
 data SsetEntry = SsetEntry
   { ssetSmplIndex :: Int
-  , ssetBytes     :: B.ByteString
+  , ssetBytes     :: HexView
   } deriving (Eq, Show)
 
 getSsetEntry :: Get SsetEntry
@@ -93,10 +94,10 @@ getSsetEntry = do
   bs <- lookAhead $ getByteString 6
   _ <- getByteString 4
   smpl <- getWord16le
-  return $ SsetEntry (fromIntegral smpl) bs
+  return $ SsetEntry (fromIntegral smpl) (HexView bs)
 
 data ProgEntry = ProgEntry
-  { progHeader :: B.ByteString
+  { progHeader :: HexView
   , progRows   :: [ProgRow]
   } deriving (Eq, Show)
 
@@ -104,13 +105,22 @@ getProgEntry :: Get ProgEntry
 getProgEntry = do
   hdr <- getByteString 0x24
   rows <- replicateM (fromIntegral $ B.index hdr 4) getProgRow
-  return $ ProgEntry hdr rows
+  return $ ProgEntry (HexView hdr) rows
 
 data ProgRow = ProgRow
-  { progRowBytes :: B.ByteString
+  { progRowPitch1 :: Int
+  , progRowPitch2 :: Int -- guessing the 2 pitches are min/max like amplitude
+  , progSsetIndex :: Int
+  , progRowBytes  :: HexView
   } deriving (Eq, Show)
 
 getProgRow :: Get ProgRow
 getProgRow = do
+  sset <- lookAhead getWord16le
   bs <- getByteString 0x14
-  return $ ProgRow bs
+  return $ ProgRow
+    { progRowBytes = HexView bs
+    , progRowPitch1 = fromIntegral $ B.index bs 2
+    , progRowPitch2 = fromIntegral $ B.index bs 4
+    , progSsetIndex = fromIntegral sset
+    }

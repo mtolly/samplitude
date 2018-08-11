@@ -18,12 +18,10 @@ import qualified Data.Conduit.Audio.SampleRate    as SR
 import qualified Data.EventList.Absolute.TimeBody as ATB
 import qualified Data.EventList.Relative.TimeBody as RTB
 import           Data.Int
-import           Data.List                        (intercalate, nub,
-                                                   stripPrefix)
+import           Data.List                        (nub, stripPrefix)
 import           Data.Maybe                       (fromMaybe, mapMaybe)
 import qualified Data.Vector.Storable             as V
 import qualified Data.Vector.Storable.Mutable     as MV
-import           Numeric
 import qualified Numeric.NonNegative.Class        as NNC
 import qualified Sound.MIDI.File.Event            as E
 import qualified Sound.MIDI.File.Load             as Load
@@ -40,10 +38,6 @@ import           Amplitude
 import           Audio
 
 import           Frequency
-
-_showByteString :: B.ByteString -> String
-_showByteString = intercalate " " . map showByte . B.unpack where
-  showByte n = if n < 0x10 then '0' : showHex n "" else showHex n ""
 
 renderSamples
   :: (MonadResource m, MonadIO n)
@@ -155,13 +149,11 @@ main = getArgs >>= \case
       forM_ (zip (concat [xs | INST xs <- chunks]) (concat [xs | INNM xs <- chunks])) $ \(ent, name) -> do
         print name
         print ent
-        print $ _showByteString $ instBytes ent
       putStrLn ""
       putStrLn "SAMPLE DIRECTIVES"
       forM_ (zip (concat [xs | SDES xs <- chunks]) (concat [xs | SDNM xs <- chunks])) $ \(ent, name) -> do
         print name
         print ent
-        print $ _showByteString $ sdesBytes ent
       putStrLn ""
       putStrLn "SAMPLES"
       forM_ (zip (concat [xs | SAMP xs <- chunks]) (concat [xs | SANM xs <- chunks])) $ \(ent, name) -> do

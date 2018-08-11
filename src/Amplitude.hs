@@ -6,6 +6,7 @@ import           Control.Monad   (replicateM)
 import           Data.Binary.Get
 import qualified Data.ByteString as B
 import           Data.Word
+import           HexView
 
 data SAMPEntry = SAMPEntry
   { sampChannels     :: Int -- guessing
@@ -21,21 +22,21 @@ data SDESEntry = SDESEntry
   , sdesPan        :: Int -- 0x00 is left, 0x40 is center, 0x7F is right
   , sdesSAMPNumber :: Int
   -- lots of other parts not deciphered yet
-  , sdesBytes      :: B.ByteString
+  , sdesBytes      :: HexView
   } deriving (Eq, Show)
 
 data INSTEntry = INSTEntry
   { instProgNumber :: Int
   , instSDESCount  :: Int
   -- other parts not deciphered yet
-  , instBytes      :: B.ByteString
+  , instBytes      :: HexView
   } deriving (Eq, Show)
 
 data BANKEntry = BANKEntry
   { bankNumber    :: Int
   , bankINSTCount :: Int
   -- other parts not deciphered yet
-  , bankBytes     :: B.ByteString
+  , bankBytes     :: HexView
   } deriving (Eq, Show)
 
 data Chunk
@@ -93,7 +94,7 @@ getSDESEntry = sizedArea $ \bs -> do
     (fromIntegral transpose)
     (fromIntegral pan)
     (fromIntegral samp)
-    bs
+    (HexView bs)
 
 getINSTEntry :: Get INSTEntry
 getINSTEntry = sizedArea $ \bs -> do
@@ -102,7 +103,7 @@ getINSTEntry = sizedArea $ \bs -> do
   _ <- getWord16le -- unknown
   _ <- getWord16le -- observed 0
   sdes <- getWord16le -- number of SDES entries for this instrument
-  return $ INSTEntry (fromIntegral prog) (fromIntegral sdes) bs
+  return $ INSTEntry (fromIntegral prog) (fromIntegral sdes) (HexView bs)
 
 getBANK :: Word32 -> Get BANKEntry
 getBANK n = do
@@ -111,7 +112,7 @@ getBANK n = do
       instCount = B.index bs 11
   -- I assume you'd use the inst count with multiple BANK entries in a .bnk,
   -- but I haven't seen that yet.
-  return $ BANKEntry (fromIntegral bankNum) (fromIntegral instCount) bs
+  return $ BANKEntry (fromIntegral bankNum) (fromIntegral instCount) (HexView bs)
 
 getSAMP :: Word32 -> Get [SAMPEntry]
 getSAMP n = case quotRem n 22 of
