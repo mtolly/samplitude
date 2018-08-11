@@ -1,0 +1,73 @@
+using "qbert" folder to study first
+
+CHUNK FORMAT
+4 bytes: IECS (SCEI... sony lol)
+4 bytes: chunk ID (read in reverse)
+4 bytes: size of whole chunk, starting from the IECS
+then the chunk-specific data
+[every chunk seems to be padded at end with FF to be a multiple of 0x10 bytes]
+
+"Vers" chunk (version)
+data:
+00 00 02 00
+
+"Head" chunk
+data:
+b0 a8 00 00 # 0xA8B0, size of the whole .hd file
+00 9e 19 00 # 0x199E00, size of the whole .bd file
+90 7e 00 00 # 0x7E90, location of "Prog" chunk in .hd file
+b0 6a 00 00 # 0x6AB0, location of "Sset" chunk in .hd file
+f0 0f 00 00 # 0xFF0, location of "Smpl" chunk in .hd file
+50 00 00 00 # 0x50, location of "Vagi" chunk in .hd file
+rest of size (0x40) is all FF (0x1C bytes)
+
+"Vagi" chunk (equivalent of SAMP in amplitude)
+4 bytes: number of entries - 1
+4 bytes for each entry: entry's byte offset within the Vagi chunk
+each entry:
+  4 bytes: byte offset for this sample in the .bd file
+  2 bytes: sample rate (22 56 for 22050, 11 2B for 11025, 44 AC for 44100)
+  2 bytes: 00 FF
+
+"Smpl" chunk
+4 bytes: number of entries - 1
+4 bytes for each entry: entry's byte offset within the Smpl chunk (some are FFFFFFFF)
+each entry (minus the ones with FFFFFFFF):
+  42 bytes.
+  first 2 bytes are probably "Vagi" index
+
+"Sset" chunk
+4 bytes: number of entries - 1
+4 bytes for each entry: entry's byte offset within the Sset chunk (some are FFFFFFFF)
+each entry (minus the ones with FFFFFFFF):
+  6 bytes. in qbert they go:
+  00 01 7F 01 00 00
+  00 01 7F 01 01 00
+  00 01 7F 01 02 00
+  ...
+  00 01 7F 01 FF 00
+  00 01 7F 01 00 01
+  00 01 7F 01 01 01
+  ...
+  00 01 7F 01 FD 01
+  last 2 bytes are probably "Smpl" index
+
+"Prog" chunk
+4 bytes: number of entries - 1
+4 bytes for each entry: entry's byte offset within the Prog chunk (some are FFFFFFFF)
+  first few in qbert:
+  58 00 00 00 (7EE8)
+  FC 02 00 00 (818C)
+  34 08 00 00 (86C4)
+  24 0A 00 00
+  C8 0C 00 00
+  84 10 00 00
+  84 16 00 00
+  00 19 00 00
+  8C 1A 00 00
+  DC 1B 00 00
+each entry (minus the ones with FFFFFFFF):
+  0x24 bytes:
+    byte 4 (starting from 0) is number of subentries
+  for each subentry:
+    0x14 bytes
