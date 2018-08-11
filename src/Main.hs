@@ -18,8 +18,8 @@ import qualified Data.Conduit.Audio.SampleRate    as SR
 import qualified Data.EventList.Absolute.TimeBody as ATB
 import qualified Data.EventList.Relative.TimeBody as RTB
 import           Data.Int
-import           Data.List                        (nub, stripPrefix)
-import           Data.Maybe                       (fromMaybe, mapMaybe)
+import           Data.List                        (isPrefixOf, nub)
+import           Data.Maybe                       (fromMaybe)
 import qualified Data.Vector.Storable             as V
 import qualified Data.Vector.Storable.Mutable     as MV
 import qualified Numeric.NonNegative.Class        as NNC
@@ -119,16 +119,39 @@ getMIDINotes trk = let
 rtbPartitionLists :: (NNC.C t) => RTB.T t ([a], [b]) -> (RTB.T t a, RTB.T t b)
 rtbPartitionLists trk = (RTB.flatten $ fmap fst trk, RTB.flatten $ fmap snd trk)
 
-findSong :: FilePath -> IO (FilePath, [FilePath])
+data SongAmplitude = SongAmplitude
+  { ampMidi :: FilePath
+  , ampBnks :: [FilePath]
+  } deriving (Eq, Show)
+
+data SongFrequency = SongFrequency
+  { freqPy   :: FilePath
+  , freqMidi :: FilePath
+  , freqHds  :: [FilePath]
+  } deriving (Eq, Show)
+
+findSong :: FilePath -> IO (Either SongAmplitude SongFrequency)
 findSong dir = do
   files <- listDirectory dir
-  let stripSuffix sfx xs = fmap reverse $ stripPrefix (reverse sfx) (reverse xs)
-  name <- case mapMaybe (stripSuffix "_g.mid") files of
-    name : _ -> return name
-    []       -> error "Couldn't find <song>_g.mid in the folder"
-  let mid = dir </> (name ++ "_g.mid")
-      banks = map (dir </>) $ filter ((== ".bnk") . takeExtension) files
-  return (mid, banks)
+  let findMidi sfx = case filter ((reverse sfx `isPrefixOf`) . reverse) files of
+        mid : _ -> return mid
+        []      -> error $ "Couldn't find MIDI file with suffix " ++ show sfx
+  case filter ((== ".py") . takeExtension) files of
+    py : _ -> do
+      mid <- findMidi "_c.mid"
+      let bankPrefix = dropExtension py
+          findHDs n = let
+            lookFor = (bankPrefix ++ "_" ++ show n ++ ".hd")
+              : [bankPrefix <.> "hd" | n == 1]
+            in case filter (`elem` lookFor) files of
+              hd : _ -> (hd :) <$> findHDs (n + 1)
+              []     -> return []
+      hds <- findHDs (1 :: Int)
+      return $ Right $ SongFrequency (dir </> py) (dir </> mid) (map (dir </>) hds)
+    [] -> do
+      mid <- findMidi "_g.mid"
+      let banks = filter ((== ".bnk") . takeExtension) files
+      return $ Left $ SongAmplitude (dir </> mid) (map (dir </>) banks)
 
 main :: IO ()
 main = getArgs >>= \case
@@ -197,143 +220,144 @@ main = getArgs >>= \case
             1
             (V.length samples)
     _ -> error $ "Unrecognized bank metadata file: " ++ bnkPath
-  "freq" : pyPath : midPath : hdPaths -> do
-    sects <- getBankSections . B8.unpack <$> B.readFile pyPath
-    Left trks <- U.decodeFile <$> Load.fromFile midPath
-    sounds <- forM (zip [0..] hdPaths) $ \(i, hdPath) -> do
-      hd <- BL.fromStrict <$> B.readFile hdPath
-      bd <- BL.fromStrict <$> B.readFile (hdPath -<.> "bd")
-      let chunks = runGet getHD hd
-      return (i, (chunks, bd))
-    let tmap = U.makeTempoMap $ head trks
-        bankChanges
-          = U.applyTempoTrack tmap
-          $ RTB.fromAbsoluteEventList
-          $ ATB.fromPairList
-          $ flip zip ([0..] :: [Int])
-          $ case sects of
-            Nothing   -> [0]
-            Just bars -> 0 : [ fromIntegral $ s * 4 | s <- bars ]
-    forM_ (zip [0..] $ tail trks) $ \(i, trkBeats) -> let
-      trk = U.applyTempoTrack tmap trkBeats
-      soundNotes = RTB.filter (\(p, _, _) -> p < 96) $ getMIDINotes trk
-      progChanges = flip RTB.mapMaybe trk $ \case
-        E.MIDIEvent (EC.Cons _ (EC.Voice (ECV.ProgramChange prog)))
-          -> Just $ ECV.fromProgram prog
-        _ -> Nothing
-      applied
-        = applyStatus1 Nothing (fmap Just bankChanges)
-        $ applyStatus1 Nothing (fmap Just progChanges)
-        $ soundNotes
-      (warnings, appliedSources) = rtbPartitionLists $ flip fmap applied $ \case
-        (Just bank, (Just prog, (pitch, vel, len))) -> case lookup bank sounds of
-          Nothing -> (["No bank with index " ++ show bank], [])
-          Just (hd, bd) -> case drop prog $ hdProg hd of
-            Just progEntry : _ -> case filter ((== pitch) . progRowPitch1) $ progRows progEntry of
-              [] -> ([unwords
-                [ "No Prog row found for bank", show bank
-                , "program", show prog
-                , "pitch", show pitch
-                ]], [])
-              rows -> mconcat $ flip map rows $ \row -> case drop (progRowSsetIndex row) $ hdSset hd of
-                Just sset : _ -> case drop (ssetSmplIndex sset) $ hdSmpl hd of
-                  Just smpl : _ -> case drop (smplVagiIndex smpl) $ hdVagi hd of
-                    Just vagi : _ -> let
-                      bytes = BL.drop (fromIntegral $ vagiFilePosition vagi) bd
-                      samples = V.fromList $ decodeSamples bytes
-                      sdes = SDESEntry
-                        { sdesMinPitch   = pitch
-                        , sdesMaxPitch   = pitch
-                        , sdesBasePitch  = pitch
-                        , sdesTranspose  = 0
-                        , sdesPan        = 0x40
-                        , sdesSAMPNumber = undefined
-                        , sdesBytes      = undefined
-                        }
-                      in ([], [(vagiRate vagi, pitch, vel, sdes, samples, len + 10)])
-                    _ -> (["no vagi"], [])
-                  _ -> (["no smpl"], [])
-                _ -> (["no sset"], [])
-            _ -> (["Bank " ++ show bank ++ " doesn't have a Prog index " ++ show prog], [])
-        _ -> (["Notes before bank and prog have been set"], [])
-      in do
-        putStrLn $ "# Track " ++ show i ++ ": " ++ maybe "no name" show (U.trackName trk)
-        forM_ (nub $ RTB.getBodies warnings) putStrLn
-        let name = takeDirectory pyPath </> concat
-              [ if (i :: Int) < 10 then '0' : show i else show i
-              , "_"
-              , map (\c -> if isAlphaNum c then c else '_') $ fromMaybe "" $ U.trackName trk
-              , ".wav"
-              ]
-        if RTB.null appliedSources
-          then putStrLn "No audio to render"
-          else do
-            audio <- runResourceT $ renderSamples appliedSources
-            runResourceT $ writeWAV name audio
   songDirs -> forM_ songDirs $ \songDir -> do
     putStrLn $ "## " ++ songDir
-    (midPath, bnkPaths) <- findSong songDir
-    Left trks <- U.decodeFile <$> Load.fromFile midPath
-    sounds <- forM bnkPaths $ \bnkPath -> do
-      bnk <- BL.fromStrict <$> B.readFile bnkPath
-      nse <- BL.fromStrict <$> B.readFile (bnkPath -<.> "nse")
-      let chunks = runGet bnkChunks bnk
-      i <- case [ b | BANK b <- chunks ] of
-        []    -> error $ "Bank " ++ show bnkPath ++ " has no BANK chunk"
-        b : _ -> return $ bankNumber b
-      return (i, (chunks, nse))
-    let tmap = U.makeTempoMap $ head trks
-    forM_ (zip [0..] $ tail trks) $ \(i, trkBeats) -> let
-      trk = U.applyTempoTrack tmap trkBeats
-      soundNotes = RTB.filter (\(p, _, _) -> p < 96) $ getMIDINotes trk
-      bankChanges = flip RTB.mapMaybe trk $ \case
-        E.MIDIEvent (EC.Cons _ (EC.Voice (ECV.Control cont v)))
-          | ECV.fromController cont == 0
-          -> Just v
-        _ -> Nothing
-      progChanges = flip RTB.mapMaybe trk $ \case
-        E.MIDIEvent (EC.Cons _ (EC.Voice (ECV.ProgramChange prog)))
-          -> Just $ ECV.fromProgram prog
-        _ -> Nothing
-      applied
-        = applyStatus1 Nothing (fmap Just bankChanges)
-        $ applyStatus1 Nothing (fmap Just progChanges)
-        $ soundNotes
-      (warnings, appliedSources) = rtbPartitionLists $ flip fmap applied $ \case
-        (Just bank, (Just prog, (pitch, vel, len))) -> case lookup bank sounds of
-          Nothing -> (["No bank with index " ++ show bank], [])
-          Just (chunks, nse) -> let
-            insts = concat [ xs | INST xs <- chunks ]
-            in case break ((== prog) . instProgNumber) insts of
-              (_, []) -> (["Bank " ++ show bank ++ " doesn't have instrument with prog " ++ show prog], [])
-              (skipInsts, inst : _) -> let
-                skipSDES = sum $ map instSDESCount skipInsts
-                sdeses = take (instSDESCount inst) $ drop skipSDES $ concat [ xs | SDES xs <- chunks ]
-                in case [ sd | sd <- sdeses, sdesMinPitch sd <= pitch && pitch <= sdesMaxPitch sd ] of
+    findSong songDir >>= \case
+      Left (SongAmplitude midPath bnkPaths) -> do
+        Left trks <- U.decodeFile <$> Load.fromFile midPath
+        sounds <- forM bnkPaths $ \bnkPath -> do
+          bnk <- BL.fromStrict <$> B.readFile bnkPath
+          nse <- BL.fromStrict <$> B.readFile (bnkPath -<.> "nse")
+          let chunks = runGet bnkChunks bnk
+          i <- case [ b | BANK b <- chunks ] of
+            []    -> error $ "Bank " ++ show bnkPath ++ " has no BANK chunk"
+            b : _ -> return $ bankNumber b
+          return (i, (chunks, nse))
+        let tmap = U.makeTempoMap $ head trks
+        forM_ (zip [0..] $ tail trks) $ \(i, trkBeats) -> let
+          trk = U.applyTempoTrack tmap trkBeats
+          soundNotes = RTB.filter (\(p, _, _) -> p < 96) $ getMIDINotes trk
+          bankChanges = flip RTB.mapMaybe trk $ \case
+            E.MIDIEvent (EC.Cons _ (EC.Voice (ECV.Control cont v)))
+              | ECV.fromController cont == 0
+              -> Just v
+            _ -> Nothing
+          progChanges = flip RTB.mapMaybe trk $ \case
+            E.MIDIEvent (EC.Cons _ (EC.Voice (ECV.ProgramChange prog)))
+              -> Just $ ECV.fromProgram prog
+            _ -> Nothing
+          applied
+            = applyStatus1 Nothing (fmap Just bankChanges)
+            $ applyStatus1 Nothing (fmap Just progChanges)
+            $ soundNotes
+          (warnings, appliedSources) = rtbPartitionLists $ flip fmap applied $ \case
+            (Just bank, (Just prog, (pitch, vel, len))) -> case lookup bank sounds of
+              Nothing -> (["No bank with index " ++ show bank], [])
+              Just (chunks, nse) -> let
+                insts = concat [ xs | INST xs <- chunks ]
+                in case break ((== prog) . instProgNumber) insts of
+                  (_, []) -> (["Bank " ++ show bank ++ " doesn't have instrument with prog " ++ show prog], [])
+                  (skipInsts, inst : _) -> let
+                    skipSDES = sum $ map instSDESCount skipInsts
+                    sdeses = take (instSDESCount inst) $ drop skipSDES $ concat [ xs | SDES xs <- chunks ]
+                    in case [ sd | sd <- sdeses, sdesMinPitch sd <= pitch && pitch <= sdesMaxPitch sd ] of
+                      [] -> ([unwords
+                        [ "No SDES entry found for bank", show bank
+                        , "program", show prog
+                        , "pitch", show pitch
+                        ]], [])
+                      -- note: there can be more than 1 matching SDES. e.g. stereo pairs of samples in supersprode
+                      sdesMatch -> mconcat $ flip map sdesMatch $ \sdes -> case drop (sdesSAMPNumber sdes) $ concat [ xs | SAMP xs <- chunks ] of
+                        [] -> (["Bank " ++ show bank ++ " doesn't have sample index " ++ show (sdesSAMPNumber sdes)], [])
+                        samp : _ -> let
+                          bytes = BL.drop (fromIntegral $ sampFilePosition samp) nse
+                          samples = V.fromList $ decodeSamples bytes
+                          in ([], [(sampRate samp, pitch, vel, sdes, samples, len + 0.001)])
+            _ -> (["Notes before bank and prog have been set"], [])
+          in do
+            putStrLn $ "# Track " ++ show i ++ ": " ++ maybe "no name" show (U.trackName trk)
+            forM_ (nub $ RTB.getBodies warnings) putStrLn
+            let name = songDir </> concat
+                  [ if (i :: Int) < 10 then '0' : show i else show i
+                  , "_"
+                  , map (\c -> if isAlphaNum c then c else '_') $ fromMaybe "" $ U.trackName trk
+                  , ".wav"
+                  ]
+            if RTB.null appliedSources
+              then putStrLn "No audio to render"
+              else do
+                audio <- runResourceT $ renderSamples appliedSources
+                runResourceT $ writeWAV name audio
+      Right (SongFrequency pyPath midPath hdPaths) -> do
+        sects <- getBankSections . B8.unpack <$> B.readFile pyPath
+        Left trks <- U.decodeFile <$> Load.fromFile midPath
+        sounds <- forM (zip [0..] hdPaths) $ \(i, hdPath) -> do
+          hd <- BL.fromStrict <$> B.readFile hdPath
+          bd <- BL.fromStrict <$> B.readFile (hdPath -<.> "bd")
+          let chunks = runGet getHD hd
+          return (i, (chunks, bd))
+        let tmap = U.makeTempoMap $ head trks
+            bankChanges
+              = U.applyTempoTrack tmap
+              $ RTB.fromAbsoluteEventList
+              $ ATB.fromPairList
+              $ flip zip ([0..] :: [Int])
+              $ case sects of
+                Nothing   -> [0]
+                Just bars -> 0 : [ fromIntegral $ s * 4 | s <- bars ]
+        forM_ (zip [0..] $ tail trks) $ \(i, trkBeats) -> let
+          trk = U.applyTempoTrack tmap trkBeats
+          soundNotes = RTB.filter (\(p, _, _) -> p < 96) $ getMIDINotes trk
+          progChanges = flip RTB.mapMaybe trk $ \case
+            E.MIDIEvent (EC.Cons _ (EC.Voice (ECV.ProgramChange prog)))
+              -> Just $ ECV.fromProgram prog
+            _ -> Nothing
+          applied
+            = applyStatus1 Nothing (fmap Just bankChanges)
+            $ applyStatus1 Nothing (fmap Just progChanges)
+            $ soundNotes
+          (warnings, appliedSources) = rtbPartitionLists $ flip fmap applied $ \case
+            (Just bank, (Just prog, (pitch, vel, len))) -> case lookup bank sounds of
+              Nothing -> (["No bank with index " ++ show bank], [])
+              Just (hd, bd) -> case drop prog $ hdProg hd of
+                Just progEntry : _ -> case filter ((== pitch) . progRowPitch1) $ progRows progEntry of
                   [] -> ([unwords
-                    [ "No SDES entry found for bank", show bank
+                    [ "No Prog row found for bank", show bank
                     , "program", show prog
                     , "pitch", show pitch
                     ]], [])
-                  -- note: there can be more than 1 matching SDES. e.g. stereo pairs of samples in supersprode
-                  sdesMatch -> mconcat $ flip map sdesMatch $ \sdes -> case drop (sdesSAMPNumber sdes) $ concat [ xs | SAMP xs <- chunks ] of
-                    [] -> (["Bank " ++ show bank ++ " doesn't have sample index " ++ show (sdesSAMPNumber sdes)], [])
-                    samp : _ -> let
-                      bytes = BL.drop (fromIntegral $ sampFilePosition samp) nse
-                      samples = V.fromList $ decodeSamples bytes
-                      in ([], [(sampRate samp, pitch, vel, sdes, samples, len + 0.001)])
-        _ -> (["Notes before bank and prog have been set"], [])
-      in do
-        putStrLn $ "# Track " ++ show i ++ ": " ++ maybe "no name" show (U.trackName trk)
-        forM_ (nub $ RTB.getBodies warnings) putStrLn
-        let name = songDir </> concat
-              [ if (i :: Int) < 10 then '0' : show i else show i
-              , "_"
-              , map (\c -> if isAlphaNum c then c else '_') $ fromMaybe "" $ U.trackName trk
-              , ".wav"
-              ]
-        if RTB.null appliedSources
-          then putStrLn "No audio to render"
-          else do
-            audio <- runResourceT $ renderSamples appliedSources
-            runResourceT $ writeWAV name audio
+                  rows -> mconcat $ flip map rows $ \row -> case drop (progRowSsetIndex row) $ hdSset hd of
+                    Just sset : _ -> case drop (ssetSmplIndex sset) $ hdSmpl hd of
+                      Just smpl : _ -> case drop (smplVagiIndex smpl) $ hdVagi hd of
+                        Just vagi : _ -> let
+                          bytes = BL.drop (fromIntegral $ vagiFilePosition vagi) bd
+                          samples = V.fromList $ decodeSamples bytes
+                          sdes = SDESEntry
+                            { sdesMinPitch   = pitch
+                            , sdesMaxPitch   = pitch
+                            , sdesBasePitch  = pitch
+                            , sdesTranspose  = 0
+                            , sdesPan        = 0x40
+                            , sdesSAMPNumber = undefined
+                            , sdesBytes      = undefined
+                            }
+                          in ([], [(vagiRate vagi, pitch, vel, sdes, samples, len + 10)])
+                        _ -> (["no vagi"], [])
+                      _ -> (["no smpl"], [])
+                    _ -> (["no sset"], [])
+                _ -> (["Bank " ++ show bank ++ " doesn't have a Prog index " ++ show prog], [])
+            _ -> (["Notes before bank and prog have been set"], [])
+          in do
+            putStrLn $ "# Track " ++ show i ++ ": " ++ maybe "no name" show (U.trackName trk)
+            forM_ (nub $ RTB.getBodies warnings) putStrLn
+            let name = takeDirectory pyPath </> concat
+                  [ if (i :: Int) < 10 then '0' : show i else show i
+                  , "_"
+                  , map (\c -> if isAlphaNum c then c else '_') $ fromMaybe "" $ U.trackName trk
+                  , ".wav"
+                  ]
+            if RTB.null appliedSources
+              then putStrLn "No audio to render"
+              else do
+                audio <- runResourceT $ renderSamples appliedSources
+                runResourceT $ writeWAV name audio
