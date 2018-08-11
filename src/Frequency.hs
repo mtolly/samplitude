@@ -2,10 +2,14 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Frequency where
 
-import           Control.Monad   (forM, replicateM, unless)
+import           Control.Monad   (forM, guard, replicateM, unless, (>=>))
 import           Data.Binary.Get
 import qualified Data.ByteString as B
+import           Data.Char       (isSpace)
+import           Data.List       (stripPrefix)
+import           Data.Maybe      (mapMaybe)
 import           HexView
+import           Text.Read       (readMaybe)
 
 data HD = HD
   { hdProg :: [Maybe ProgEntry]
@@ -108,10 +112,10 @@ getProgEntry = do
   return $ ProgEntry (HexView hdr) rows
 
 data ProgRow = ProgRow
-  { progRowPitch1 :: Int
-  , progRowPitch2 :: Int -- guessing the 2 pitches are min/max like amplitude
-  , progSsetIndex :: Int
-  , progRowBytes  :: HexView
+  { progRowPitch1    :: Int
+  , progRowPitch2    :: Int -- guessing the 2 pitches are min/max like amplitude
+  , progRowSsetIndex :: Int
+  , progRowBytes     :: HexView
   } deriving (Eq, Show)
 
 getProgRow :: Get ProgRow
@@ -122,5 +126,17 @@ getProgRow = do
     { progRowBytes = HexView bs
     , progRowPitch1 = fromIntegral $ B.index bs 2
     , progRowPitch2 = fromIntegral $ B.index bs 4
-    , progSsetIndex = fromIntegral sset
+    , progRowSsetIndex = fromIntegral sset
     }
+
+getBankSections :: String -> Maybe [Int]
+getBankSections py = let
+  noSpace = filter $ not . isSpace
+  lns = map noSpace $ lines py
+  in do
+    guard $ noSpace "def use_bank_swapping (self): return 1" `elem` lns
+    let getBoundaries = stripPrefix "self.section_boundaries=" >=> readMaybe
+        defBoundaries = [8, 16, 24, 32] -- from defaults.py
+    Just $ case reverse $ mapMaybe getBoundaries lns of
+      []     -> defBoundaries
+      xs : _ -> xs
