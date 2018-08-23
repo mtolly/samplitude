@@ -78,6 +78,8 @@ getVagiEntry = do
 
 data SmplEntry = SmplEntry
   { smplVagiIndex :: Int
+  , smplBasePitch :: Int
+  , smplMaybeCutoff :: Int
   , smplBytes     :: HexView
   } deriving (Eq, Show)
 
@@ -86,7 +88,12 @@ getSmplEntry = do
   bs <- lookAhead $ getByteString 42
   vagi <- getWord16le
   _ <- getByteString 40
-  return $ SmplEntry (fromIntegral vagi) (HexView bs)
+  return $ SmplEntry
+    { smplVagiIndex = fromIntegral vagi
+    , smplBasePitch = fromIntegral $ B.index bs 11
+    , smplMaybeCutoff = fromIntegral $ B.index bs 20
+    , smplBytes = HexView bs
+    }
 
 data SsetEntry = SsetEntry
   { ssetSmplIndex :: Int
@@ -112,8 +119,10 @@ getProgEntry = do
   return $ ProgEntry (HexView hdr) rows
 
 data ProgRow = ProgRow
-  { progRowPitch1    :: Int
-  , progRowPitch2    :: Int -- guessing the 2 pitches are min/max like amplitude
+  { progRowMinPitch  :: Int
+  , progRowMaxPitch  :: Int
+  , progRowVol       :: Int -- not sure of this. appears to be out of 80
+  , progRowPan       :: Int -- assuming works like amplitude (00 L to 7F R, or maybe 80)
   , progRowSsetIndex :: Int
   , progRowBytes     :: HexView
   } deriving (Eq, Show)
@@ -124,8 +133,10 @@ getProgRow = do
   bs <- getByteString 0x14
   return $ ProgRow
     { progRowBytes = HexView bs
-    , progRowPitch1 = fromIntegral $ B.index bs 2
-    , progRowPitch2 = fromIntegral $ B.index bs 4
+    , progRowMinPitch = fromIntegral $ B.index bs 2
+    , progRowMaxPitch = fromIntegral $ B.index bs 4
+    , progRowVol = fromIntegral $ B.index bs 16
+    , progRowPan = fromIntegral $ B.index bs 17
     , progRowSsetIndex = fromIntegral sset
     }
 

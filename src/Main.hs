@@ -162,8 +162,18 @@ main = getArgs >>= \case
     void getLine
   "print" : bnkPaths -> forM_ bnkPaths $ \bnkPath -> case takeExtension bnkPath of
     ".hd" -> do
-      hd <- BL.fromStrict <$> B.readFile bnkPath
-      print $ runGet getHD hd
+      hd <- runGet getHD . BL.fromStrict <$> B.readFile bnkPath
+      let printList typ xs = do
+            putStrLn $ "LIST: " <> typ
+            putStrLn ""
+            forM_ (zip [0..] xs) $ \(i, x) -> do
+              putStrLn $ typ <> " #" <> show (i :: Int)
+              print x
+              putStrLn ""
+      printList "Prog" $ hdProg hd
+      printList "Sset" $ hdSset hd
+      printList "Smpl" $ hdSmpl hd
+      printList "Vagi" $ hdVagi hd
     ".bnk" -> do
       putStrLn bnkPath
       putStrLn ""
@@ -317,10 +327,10 @@ main = getArgs >>= \case
             $ applyStatus1 Nothing (fmap Just progChanges)
             $ soundNotes
           (warnings, appliedSources) = rtbPartitionLists $ flip fmap applied $ \case
-            (Just bank, (Just prog, (pitch, vel, len))) -> case lookup bank sounds of
+            (Just bank, (Just prog, (pitch, _vel, len))) -> case lookup bank sounds of
               Nothing -> (["No bank with index " ++ show bank], [])
               Just (hd, bd) -> case drop prog $ hdProg hd of
-                Just progEntry : _ -> case filter ((== pitch) . progRowPitch1) $ progRows progEntry of
+                Just progEntry : _ -> case [ row | row <- progRows progEntry, progRowMinPitch row <= pitch && pitch <= progRowMaxPitch row ] of
                   [] -> ([unwords
                     [ "No Prog row found for bank", show bank
                     , "program", show prog
@@ -333,15 +343,20 @@ main = getArgs >>= \case
                           bytes = BL.drop (fromIntegral $ vagiFilePosition vagi) bd
                           samples = V.fromList $ decodeSamples bytes
                           sdes = SDESEntry
-                            { sdesMinPitch   = pitch
-                            , sdesMaxPitch   = pitch
-                            , sdesBasePitch  = pitch
+                            { sdesMinPitch   = progRowMinPitch row
+                            , sdesMaxPitch   = progRowMaxPitch row
+                            , sdesBasePitch  = smplBasePitch smpl
                             , sdesTranspose  = 0
-                            , sdesPan        = 0x40
+                            , sdesPan        = progRowPan row
                             , sdesSAMPNumber = undefined
                             , sdesBytes      = undefined
                             }
-                          in ([], [(vagiRate vagi, pitch, vel, sdes, samples, len + 10)])
+                          -- this is a complete guess. some samples cut off at note end and some don't
+                          len' = if smplMaybeCutoff smpl >= 0xd0
+                            then 10
+                            else len + 0.001
+                          vol = 0x7F -- progRowVol row (TODO figure this out)
+                          in ([], [(vagiRate vagi, pitch, vol, sdes, samples, len')])
                         _ -> (["no vagi"], [])
                       _ -> (["no smpl"], [])
                     _ -> (["no sset"], [])
