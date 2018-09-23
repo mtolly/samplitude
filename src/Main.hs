@@ -32,13 +32,13 @@ import           System.Directory                 (createDirectoryIfMissing,
                                                    listDirectory)
 import           System.Environment               (getArgs)
 import           System.FilePath                  (dropExtension, takeDirectory,
-                                                   takeExtension, (-<.>), (<.>),
-                                                   (</>))
+                                                   takeExtension, takeFileName,
+                                                   (-<.>), (<.>), (</>))
 
 import           Amplitude
 import           Audio
-
 import           Frequency
+import           Reaper
 
 renderSamples
   :: (MonadResource m, MonadIO n)
@@ -230,6 +230,99 @@ main = getArgs >>= \case
             1
             (V.length samples)
     _ -> error $ "Unrecognized bank metadata file: " ++ bnkPath
+  "reaper" : songDirs -> forM_ songDirs $ \songDir -> do
+    putStrLn $ "## " ++ songDir
+    findSong songDir >>= \case
+      Right SongFrequency{} -> return () -- not implemented
+      Left (SongAmplitude midPath bnkPaths) -> do
+        Left trks <- U.decodeFile <$> Load.fromFile midPath
+        sounds <- forM bnkPaths $ \bnkPath -> do
+          bnk <- BL.fromStrict <$> B.readFile bnkPath
+          nse <- BL.fromStrict <$> B.readFile (bnkPath -<.> "nse")
+          let outDir = dropExtension bnkPath ++ "_samples"
+              outDirRelative = takeFileName outDir
+          createDirectoryIfMissing False outDir
+          let chunks = runGet bnkChunks bnk
+              samp = concat [ xs | SAMP xs <- chunks ]
+              sanm = concat [ xs | SANM xs <- chunks ]
+          i <- case [ b | BANK b <- chunks ] of
+            []    -> error $ "Bank " ++ show bnkPath ++ " has no BANK chunk"
+            b : _ -> return $ bankNumber b
+          samps <- forM (zip samp sanm) $ \(entry, name) -> do
+            let bytes = BL.drop (fromIntegral $ sampFilePosition entry) nse
+                samples = V.fromList $ decodeSamples bytes
+                sampPath         = outDir         </> B8.unpack name <.> "wav"
+                sampPathRelative = outDirRelative </> B8.unpack name <.> "wav"
+            if sampRate entry /= 0
+              then do
+                runResourceT $ writeWAV sampPath $ A.AudioSource
+                  (C.yield samples)
+                  (realToFrac $ sampRate entry)
+                  1
+                  (V.length samples)
+                return $ Just sampPathRelative
+              else return Nothing
+          return (i, (chunks, samps))
+        let outRPP = songDir </> "project.RPP"
+        (writeRPP outRPP =<<) $ rpp "REAPER_PROJECT" ["0.1", "5.0/OSX64", "1449358215"] $ do
+          line "VZOOMEX" ["0"]
+          line "SAMPLERATE" ["44100", "0", "0"]
+          block "METRONOME" ["6", "2"] $ return () -- disables metronome
+          let tmap = U.makeTempoMap $ head trks
+          tempoTrack $ RTB.toAbsoluteEventList 0 $ U.applyTempoTrack tmap $ processTempoTrack $ head trks
+          forM_ (zip [0..] $ tail trks) $ \(i, trkBeats) -> let
+            trk = U.applyTempoTrack tmap trkBeats
+            soundNotes = RTB.filter (\(p, _, _) -> p < 96) $ getMIDINotes trk
+            bankChanges = flip RTB.mapMaybe trk $ \case
+              E.MIDIEvent (EC.Cons _ (EC.Voice (ECV.Control cont v)))
+                | ECV.fromController cont == 0
+                -> Just v
+              _ -> Nothing
+            progChanges = flip RTB.mapMaybe trk $ \case
+              E.MIDIEvent (EC.Cons _ (EC.Voice (ECV.ProgramChange prog)))
+                -> Just $ ECV.fromProgram prog
+              _ -> Nothing
+            applied
+              = applyStatus1 Nothing (fmap Just bankChanges)
+              $ applyStatus1 Nothing (fmap Just progChanges)
+              $ soundNotes
+            (warnings, appliedSources) = rtbPartitionLists $ flip fmap applied $ \case
+              (Just bank, (Just prog, (pitch, vel, len))) -> case lookup bank sounds of
+                Nothing -> (["No bank with index " ++ show bank], [])
+                Just (chunks, samps) -> let
+                  insts = concat [ xs | INST xs <- chunks ]
+                  in case break ((== prog) . instProgNumber) insts of
+                    (_, []) -> (["Bank " ++ show bank ++ " doesn't have instrument with prog " ++ show prog], [])
+                    (skipInsts, inst : _) -> let
+                      skipSDES = sum $ map instSDESCount skipInsts
+                      sdeses = take (instSDESCount inst) $ drop skipSDES $ concat [ xs | SDES xs <- chunks ]
+                      in case [ sd | sd <- sdeses, sdesMinPitch sd <= pitch && pitch <= sdesMaxPitch sd ] of
+                        [] -> ([unwords
+                          [ "No SDES entry found for bank", show bank
+                          , "program", show prog
+                          , "pitch", show pitch
+                          ]], [])
+                        -- note: there can be more than 1 matching SDES. e.g. stereo pairs of samples in supersprode
+                        sdesMatch -> mconcat $ flip map sdesMatch $ \sdes -> case drop (sdesSAMPNumber sdes) samps of
+                          Just path : _ -> ([], [(path, sdes, pitch, vel, len)])
+                          Nothing : _ -> (["Bank " ++ show bank ++ " has empty sample at index " ++ show (sdesSAMPNumber sdes)], [])
+                          _ -> (["Bank " ++ show bank ++ " doesn't have sample index " ++ show (sdesSAMPNumber sdes)], [])
+              _ -> (["Notes before bank and prog have been set"], [])
+            in do
+              liftIO $ putStrLn $ "# Track " ++ show (i :: Int) ++ ": " ++ maybe "no name" show (U.trackName trk)
+              liftIO $ forM_ (nub $ RTB.getBodies warnings) putStrLn
+              block "TRACK" [] $ do
+                line "NAME" [fromMaybe "Unnamed track" $ U.trackName trk]
+                -- todo: make pretty colors
+                line "TRACKHEIGHT" ["0", "0"]
+                line "FX" ["0"]
+                block "FXCHAIN" [] $ return ()
+                forM_ (ATB.toPairList $ RTB.toAbsoluteEventList 0 appliedSources) $ \(posn, (path, sdes, pitch, vel, len)) -> do
+                  insertAudio posn len
+                    (sdesTranspose sdes + (pitch - sdesBasePitch sdes))
+                    ((fromIntegral (sdesPan sdes) / 0x7F) * 2 - 1)
+                    (fromIntegral vel / 0x7F)
+                    path
   songDirs -> forM_ songDirs $ \songDir -> do
     putStrLn $ "## " ++ songDir
     findSong songDir >>= \case

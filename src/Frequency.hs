@@ -77,10 +77,10 @@ getVagiEntry = do
   return $ VagiEntry (fromIntegral posn) (fromIntegral rate) (HexView bs)
 
 data SmplEntry = SmplEntry
-  { smplVagiIndex :: Int
-  , smplBasePitch :: Int
+  { smplVagiIndex   :: Int
+  , smplBasePitch   :: Int
   , smplMaybeCutoff :: Int
-  , smplBytes     :: HexView
+  , smplBytes       :: HexView
   } deriving (Eq, Show)
 
 getSmplEntry :: Get SmplEntry
