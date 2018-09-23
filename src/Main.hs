@@ -1,4 +1,5 @@
 {-# LANGUAGE LambdaCase        #-}
+{-# LANGUAGE MultiWayIf        #-}
 {-# LANGUAGE OverloadedStrings #-}
 module Main (main) where
 
@@ -19,6 +20,7 @@ import qualified Data.EventList.Absolute.TimeBody as ATB
 import qualified Data.EventList.Relative.TimeBody as RTB
 import           Data.Int
 import           Data.List                        (isPrefixOf, nub)
+import           Data.List                        (isInfixOf)
 import           Data.Maybe                       (fromMaybe)
 import qualified Data.Vector.Storable             as V
 import qualified Data.Vector.Storable.Mutable     as MV
@@ -155,11 +157,13 @@ findSong dir = do
 
 main :: IO ()
 main = getArgs >>= \case
+
   [] -> do
     putStrLn "samplitude (Amplitude [PS2] audio renderer)"
     putStrLn "Drag a song folder onto this .exe to run."
     putStrLn "(press enter to close)"
     void getLine
+
   "print" : bnkPaths -> forM_ bnkPaths $ \bnkPath -> case takeExtension bnkPath of
     ".hd" -> do
       hd <- runGet getHD . BL.fromStrict <$> B.readFile bnkPath
@@ -195,6 +199,7 @@ main = getArgs >>= \case
         print ent
       putStrLn ""
     _ -> error $ "Unrecognized bank metadata file: " ++ bnkPath
+
   "samples" : bnks -> forM_ bnks $ \bnkPath -> case takeExtension bnkPath of
     ".hd" -> do
       hd <- BL.fromStrict <$> B.readFile bnkPath
@@ -230,6 +235,7 @@ main = getArgs >>= \case
             1
             (V.length samples)
     _ -> error $ "Unrecognized bank metadata file: " ++ bnkPath
+
   "reaper" : songDirs -> forM_ songDirs $ \songDir -> do
     putStrLn $ "## " ++ songDir
     findSong songDir >>= \case
@@ -257,15 +263,16 @@ main = getArgs >>= \case
               then do
                 runResourceT $ writeWAV sampPath $ A.AudioSource
                   (C.yield samples)
-                  (realToFrac $ sampRate entry)
+                  (fromIntegral $ sampRate entry)
                   1
                   (V.length samples)
-                return $ Just sampPathRelative
+                return $ Just (sampPathRelative, fromIntegral (V.length samples) / fromIntegral (sampRate entry))
               else return Nothing
           return (i, (chunks, samps))
         let outRPP = songDir </> "project.RPP"
         (writeRPP outRPP =<<) $ rpp "REAPER_PROJECT" ["0.1", "5.0/OSX64", "1449358215"] $ do
           line "VZOOMEX" ["0"]
+          line "ITEMMIX" ["1"] -- always mix stacked audio items
           line "SAMPLERATE" ["44100", "0", "0"]
           block "METRONOME" ["6", "2"] $ return () -- disables metronome
           let tmap = U.makeTempoMap $ head trks
@@ -304,7 +311,7 @@ main = getArgs >>= \case
                           ]], [])
                         -- note: there can be more than 1 matching SDES. e.g. stereo pairs of samples in supersprode
                         sdesMatch -> mconcat $ flip map sdesMatch $ \sdes -> case drop (sdesSAMPNumber sdes) samps of
-                          Just path : _ -> ([], [(path, sdes, pitch, vel, len)])
+                          Just (path, audioLen) : _ -> ([], [(path, sdes, pitch, vel, min len audioLen)])
                           Nothing : _ -> (["Bank " ++ show bank ++ " has empty sample at index " ++ show (sdesSAMPNumber sdes)], [])
                           _ -> (["Bank " ++ show bank ++ " doesn't have sample index " ++ show (sdesSAMPNumber sdes)], [])
               _ -> (["Notes before bank and prog have been set"], [])
@@ -312,8 +319,26 @@ main = getArgs >>= \case
               liftIO $ putStrLn $ "# Track " ++ show (i :: Int) ++ ": " ++ maybe "no name" show (U.trackName trk)
               liftIO $ forM_ (nub $ RTB.getBodies warnings) putStrLn
               block "TRACK" [] $ do
-                line "NAME" [fromMaybe "Unnamed track" $ U.trackName trk]
-                -- todo: make pretty colors
+                let name = fromMaybe "Unnamed track" $ U.trackName trk
+                line "NAME" [name]
+                let encodeColor (r, g, b) = 0x1000000 + 0x10000 * b + 0x100 * g + r :: Int
+                    color rgb = line "PEAKCOL" [show $ encodeColor rgb]
+                if  | "CATCH:D:" `isInfixOf` name -> color (244, 75, 75)  -- red
+                    | "CATCH:B:" `isInfixOf` name -> color (78, 62, 224)  -- blue
+                    | "CATCH:S:" `isInfixOf` name -> color (232, 221, 76) -- yellow
+                    | "CATCH:V:" `isInfixOf` name -> color (95, 232, 88)  -- green
+                    | "CATCH:G:" `isInfixOf` name -> color (237, 171, 56) -- orange
+                    | "CATCH:F:" `isInfixOf` name -> color (233, 62, 242) -- purple
+                    | otherwise              -> return ()
+                line "MUTESOLO"
+                  [ if   "AXE_CONTOUR" `isInfixOf` name
+                      || "AXE_HARMONY" `isInfixOf` name
+                      || "SCRATCH"     `isInfixOf` name
+                    then "1" -- muted
+                    else "0" -- not muted
+                  , "0" -- 2 if solo'd, else 0
+                  , "0" -- dunno
+                  ]
                 line "TRACKHEIGHT" ["0", "0"]
                 line "FX" ["0"]
                 block "FXCHAIN" [] $ return ()
@@ -323,6 +348,7 @@ main = getArgs >>= \case
                     ((fromIntegral (sdesPan sdes) / 0x7F) * 2 - 1)
                     (fromIntegral vel / 0x7F)
                     path
+
   songDirs -> forM_ songDirs $ \songDir -> do
     putStrLn $ "## " ++ songDir
     findSong songDir >>= \case

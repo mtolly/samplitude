@@ -91,6 +91,7 @@ insertAudio posn len semis pan vol path = let
     line "POSITION" [showDouble (realToFrac posn :: Double)]
     line "LOOP" ["0"]
     line "LENGTH" [showDouble (realToFrac len :: Double)]
+    line "FADEFLAG" ["1"] -- no auto crossfades
     line "NAME" [name]
     line "VOLPAN"
       [ "1" -- dunno
