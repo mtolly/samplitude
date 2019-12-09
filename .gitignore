@@ -1,4 +1,5 @@
 *.bnk
 *.nse
 .stack-work/
+stack.yaml.lock
 win/
